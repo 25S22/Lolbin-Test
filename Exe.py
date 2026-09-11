@@ -1,35 +1,56 @@
 """
-LOLBin Masquerading Tester -- Scoped Edition (Zero-Payload)
-==============================================================
-Covers exactly these 10 LOLBins:
-  AddinUtil.exe, Diantz.exe, Control.exe, ilasm.exe, RunExeHelper.exe,
-  RdrLeakDiag.exe, msedge.exe, CustomShellHost.exe, Hh.exe, Mavinject.exe
+LOLBin Masquerading Tester -- Matched to Your QRadar Rule Definitions
+========================================================================
+Built directly from the exact QRadar rule logic you provided for each of
+your 10 LOLBin use cases (all share: BB: Windows Process Creation, then
+per-binary conditions below). Every case is engineered to satisfy the
+literal AND/OR conditions of YOUR rule -- not a guess at real-world
+attacker syntax, not a probe of any third-party product's detection
+internals.
 
-SAFETY MODEL:
-Every process that actually executes is an unmodified copy of
-hostname.exe, renamed on disk to match each LOLBin's filename. Windows
-launches binaries by their PE header, not their filename, so no matter
-what name or arguments are used, the code that runs is only ever
-hostname.exe: print computer name, exit. Argument strings below mimic
-publicly documented LOLBAS usage patterns purely so the CommandLine field
-in your telemetry looks realistic -- hostname.exe does nothing with them.
+SAFETY MODEL (unchanged from prior versions):
+- 8 of the 10 cases run an unmodified copy of hostname.exe, renamed on
+  disk to the LOLBin's filename. hostname.exe prints the local computer
+  name and exits; it has no argument-triggered functionality of any kind.
+- 2 of the 10 cases (Hh.exe, CustomShellHost.exe) need their QRadar rule's
+  "Parent Process Name" condition satisfied, which requires an ACTUAL
+  child process, not just a name -- hostname.exe cannot spawn one. For
+  only these two, the renamed binary is a copy of cmd.exe, invoked with
+  exactly one hardcoded, non-attacker-controlled argument: "/c hostname.exe".
+  This is real (not spoofed) process spawning -- the same mundane
+  operation every installer/script performs -- and it never executes
+  anything beyond the one fixed, harmless command baked into this script.
+- Every copy (hostname.exe AND cmd.exe) is SHA256-verified against the
+  real system binary immediately before it is executed. Any mismatch
+  aborts that test case with nothing run.
+- Full cleanup is verified after every run (see verified_cleanup()), and
+  any leftovers from a previous interrupted run are swept at startup.
 
-HASH-VERIFIED, NOT JUST "TRUST ME": before each renamed copy is executed,
-the script computes its SHA256 and compares it against the SHA256 of the
-real C:\Windows\System32\hostname.exe. If they don't match byte-for-byte,
-that test case is aborted and nothing runs for it. This is a checkable
-guarantee -- not an assertion -- that no other code is ever introduced
-into the chain. Both hashes are printed and saved to a results JSON file
-alongside every command that was actually run, so you have a concrete
-record of what happened on this laptop before you move to real technique
-testing on an isolated test server.
+WHAT THIS CANNOT DO, STILL:
+This validates whether YOUR QRadar rules fire on process name / command
+line / parent-child relationship. It cannot make a real EDR's behavioral
+engine react, because no real technique (injection, memory access,
+compilation, cabinet creation) is ever performed. That ceiling hasn't
+changed -- only the fidelity of the QRadar-facing telemetry has.
 
-ACCURACY NOTE: I don't have live web access in this session, so exact
-flag syntax for the less common entries (AddinUtil, RunExeHelper,
-RdrLeakDiag, CustomShellHost) is reconstructed from memory and may not
-match the current LOLBAS.org entry or your specific QRadar rule's regex
-exactly. Cross-check against LOLBAS.org and adjust the `args` lambdas if
-your rule needs an exact match.
+YOUR RULE DEFINITIONS (as given), mapped 1:1 to the LOLBIN_TEST_CASES
+dict below -- see the "qradar_logic" field on each entry:
+  1. Mavinject.exe:      Command contains "/INJECTRUNNING"
+                          AND parent process is NOT AppVClient.exe
+  2. Hh.exe:              Parent Process Name contains "hh.exe"
+  3. AddinUtil.exe:       Command contains "addinutil.exe"
+                          AND ("-addinroot" or "-pipelineroot")
+  4. Diantz.exe:          Command contains "diantz" AND ".cab"
+  5. Control.exe:         Command contains "control.exe" AND "dll"
+  6. ilasm.exe:           Process Name contains "ilasm.exe" (no cmdline test)
+  7. RunExeHelper.exe:    Command contains "runexehelper"
+  8. RdrLeakDiag.exe:     Command contains "rdrleakdiag"
+                          AND ("fullmemdump" or "/memdmp" or "-memdmp")
+                          AND ("-o" or "/o" or "-p" or "/p")
+  9. msedge.exe:          Command contains "msedge.exe" AND "--headless"
+                          AND "dump-dom" AND "http" AND "--gpu-launcher="
+  10. CustomShellHost.exe: Parent Process Name contains "customshellhost.exe"
+                          AND spawned Process Name does NOT contain "explorer.exe"
 
 REQUIREMENTS: Windows only.
 """
@@ -46,108 +67,101 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# "none" | "cmd" | "powershell" -- what spawns each decoy process.
-PARENT_CHAIN = "none"
-
-# Drop inert placeholder files referenced in each command line (text only,
-# not valid PE/IL/CPL/CAB in any way -- cannot be loaded or executed).
-DROP_ARTIFACT_FILES = True
-
-# Keep a JSON record of what ran after cleanup (recommended for an audit
-# trail). Set False for a fully ephemeral run: console output only, nothing
-# written to disk that survives the script.
+# Keep a JSON record of what ran after cleanup. Set False for a fully
+# ephemeral run: console output only, nothing written to disk that survives.
 KEEP_RESULTS_LOG = True
 
 CANARY_TAG = f"PURPLE-TEAM-TEST-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"
+SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"   # used for 8 of 10 cases
+SAFE_PARENT_BINARY = r"C:\Windows\System32\cmd.exe"         # used only for the 2 parent-check cases
+
+# Drop inert placeholder files referenced in each command line (plain text
+# only -- never a valid PE/IL/CPL/DLL/CAB in any way).
+DROP_ARTIFACT_FILES = True
 
 LOLBIN_TEST_CASES = {
-    "AddinUtil.exe": {
-        "confidence": "low",
-        "artifact": None,
-        "technique": "T1218 - Executes DLLs discovered via .NET add-in pipeline scanning",
+    "Mavinject.exe": {
+        "spawn_style": "direct",
         "args_variants": [
-            lambda: ["-nodep", "-pipeline:decoy_addins_dir"],
+            lambda: [str(os.getpid()), "/INJECTRUNNING", "decoy_payload.dll"],
         ],
+        "artifact": "decoy_payload.dll",
+        "qradar_logic": "Command contains '/INJECTRUNNING' AND parent is not AppVClient.exe",
+    },
+    "Hh.exe": {
+        "spawn_style": "parent_child",
+        "args_variants": [lambda: []],
+        "artifact": None,
+        "qradar_logic": "Parent Process Name contains 'hh.exe'",
+    },
+    "AddinUtil.exe": {
+        "spawn_style": "direct",
+        "args_variants": [
+            lambda: ["-pipelineroot:decoy_addins_dir"],
+        ],
+        "artifact": None,
+        "qradar_logic": "Command contains 'addinutil.exe' AND ('-addinroot' or '-pipelineroot')",
     },
     "Diantz.exe": {
-        "confidence": "high",
-        "artifact": "decoy_archive.cab",
-        "technique": "T1560.001 - Cabinet file creation for staging/exfil",
+        "spawn_style": "direct",
         "args_variants": [
             lambda: ["decoy_source.txt", "decoy_archive.cab"],
         ],
+        "artifact": "decoy_archive.cab",
+        "qradar_logic": "Command contains 'diantz' AND '.cab'",
     },
     "Control.exe": {
-        "confidence": "high",
-        "artifact": "decoy_payload.cpl",
-        "technique": "T1218.002 - Loads a Control Panel item (.cpl) as code",
+        "spawn_style": "direct",
         "args_variants": [
-            lambda: ["decoy_payload.cpl"],
-            lambda: ["/name", "Microsoft.ThisPC", "/z", "decoy_payload.cpl"],
+            lambda: ["decoy_payload.dll"],
         ],
+        "artifact": "decoy_payload.dll",
+        "qradar_logic": "Command contains 'control.exe' AND 'dll'",
     },
     "ilasm.exe": {
-        "confidence": "high",
-        "artifact": "decoy_output.exe",
-        "technique": "T1027 / T1218 - Compiles IL to an EXE to evade static AV",
+        "spawn_style": "direct",
         "args_variants": [
             lambda: ["decoy_payload.il", "/output=decoy_output.exe"],
-            lambda: ["/exe", "/output=decoy_output.exe", "decoy_payload.il"],
         ],
+        "artifact": "decoy_output.exe",
+        "qradar_logic": "Process Name contains 'ilasm.exe' (no command-line condition)",
     },
     "RunExeHelper.exe": {
-        "confidence": "low",
-        "artifact": None,
-        "technique": "T1218 - Proxy execution of an arbitrary specified binary",
+        "spawn_style": "direct",
         "args_variants": [
             lambda: ["decoy_target.exe"],
         ],
+        "artifact": None,
+        "qradar_logic": "Command contains 'runexehelper'",
     },
     "RdrLeakDiag.exe": {
-        "confidence": "medium",
-        "artifact": None,
-        "technique": "T1003 - Process memory diagnostic tool abused for memory dumping",
+        "spawn_style": "direct",
         "args_variants": [
-            lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/wait:0"],
-            lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/fullmemdmp"],
+            lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/memdmp"],
+            lambda: [f"-p:{os.getpid()}", "-o:decoy_dump_dir", "fullmemdump"],
         ],
+        "artifact": None,
+        "qradar_logic": ("Command contains 'rdrleakdiag' AND "
+                          "('fullmemdump' or '/memdmp' or '-memdmp') AND "
+                          "('-o' or '/o' or '-p' or '/p')"),
     },
     "msedge.exe": {
-        "confidence": "high",
-        "artifact": None,
-        "technique": "T1105 / T1218 - Headless browser used to fetch/render remote content",
+        "spawn_style": "direct",
         "args_variants": [
-            lambda: ["--headless", "--disable-gpu", "--dump-dom", "https://example.com"],
-            lambda: ["--headless=new", "--disable-gpu", "--print-to-pdf=decoy_output.pdf", "https://example.com"],
+            lambda: ["--headless", "--disable-gpu", "--gpu-launcher=decoy_launcher.exe",
+                     "--dump-dom", "https://example.com"],
         ],
+        "artifact": None,
+        "qradar_logic": ("Command contains 'msedge.exe' AND '--headless' AND "
+                          "'dump-dom' AND 'http' AND '--gpu-launcher='"),
     },
     "CustomShellHost.exe": {
-        "confidence": "low",
+        "spawn_style": "parent_child",
+        "args_variants": [lambda: []],
         "artifact": None,
-        "technique": "T1218 - Can spawn a command shell as a default-shell replacement",
-        "args_variants": [
-            lambda: [],
-        ],
-    },
-    "Hh.exe": {
-        "confidence": "medium",
-        "artifact": "decoy_payload.chm",
-        "technique": "T1218 - HTML Help executable used to run script/code embedded in a .chm",
-        "args_variants": [
-            lambda: ["decoy_payload.chm"],
-            lambda: ["ms-its:decoy_payload.chm::/payload.htm"],
-        ],
-    },
-    "Mavinject.exe": {
-        "confidence": "high",
-        "artifact": "decoy_payload.dll",
-        "technique": "T1218 / T1055.001 - Process injection via signed binary",
-        "args_variants": [
-            lambda: [str(os.getpid()), "/INJECTRUNNING", "decoy_payload.dll"],
-            lambda: [str(os.getpid()), "/INJECTRUNNING32", "decoy_payload.dll"],
-        ],
+        "qradar_logic": ("Parent Process Name contains 'customshellhost.exe' AND "
+                          "spawned Process Name does not contain 'explorer.exe'"),
     },
 }
 
@@ -161,12 +175,9 @@ def sha256_of(path):
 
 
 def sweep_stray_runs():
-    """Remove any leftover work dirs from a prior run that crashed or was
-    killed before its own cleanup ran (e.g. power loss, forced termination).
-    Returns the list of stray paths that were found and removed."""
     base = Path(tempfile.gettempdir())
     removed = []
-    for p in base.glob("lolbin_scoped_*"):
+    for p in base.glob("lolbin_qradar_*"):
         if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
             if not p.exists():
@@ -175,11 +186,9 @@ def sweep_stray_runs():
 
 
 def verified_cleanup(work_dir):
-    """Delete work_dir and prove it's gone. Returns (success, leftover_files)."""
     shutil.rmtree(work_dir, ignore_errors=True)
     if not work_dir.exists():
         return True, []
-    # Something's locked -- try file-by-file so we can report exactly what's stuck.
     leftover = []
     for p in work_dir.rglob("*"):
         if p.is_file():
@@ -194,156 +203,148 @@ def verified_cleanup(work_dir):
     return (not work_dir.exists()), leftover
 
 
-def build_command(decoy_path, args):
-    if PARENT_CHAIN == "cmd":
-        return ["cmd.exe", "/c", str(decoy_path)] + args
-    if PARENT_CHAIN == "powershell":
-        full = " ".join([f'"{decoy_path}"'] + args)
-        return ["powershell.exe", "-NoProfile", "-Command", full]
-    return [str(decoy_path)] + args
+def run_and_classify(cmd, timeout=15):
+    """Run cmd, returning a human-readable status string. Explicitly labels
+    WinError 5 (Access Denied) as EDR/AV prevention rather than a generic error."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return f"exited on its own (rc={proc.returncode})", False
+    except subprocess.TimeoutExpired:
+        return "did not exit within timeout (kill and check manually)", False
+    except OSError as e:
+        if getattr(e, "winerror", None) == 5:
+            return "BLOCKED (WinError 5 Access Denied -- EDR/AV prevention fired)", True
+        return f"error: {e}", False
+    except Exception as e:
+        return f"error: {e}", False
 
 
 def main():
     if platform.system() != "Windows":
-        print("This script copies a native Windows binary (hostname.exe) "
+        print("This script copies native Windows binaries (hostname.exe, cmd.exe) "
               "and must be run on Windows. Exiting without doing anything.")
         sys.exit(1)
 
-    if not Path(SAFE_SOURCE_BINARY).exists():
-        print(f"Could not find {SAFE_SOURCE_BINARY} -- aborting, nothing was run.")
+    if not Path(SAFE_SOURCE_BINARY).exists() or not Path(SAFE_PARENT_BINARY).exists():
+        print("Could not find hostname.exe or cmd.exe in System32 -- aborting.")
         sys.exit(1)
 
     source_hash = sha256_of(SAFE_SOURCE_BINARY)
+    parent_hash = sha256_of(SAFE_PARENT_BINARY)
 
     stray = sweep_stray_runs()
     if stray:
-        print(f"Swept {len(stray)} leftover folder(s) from a previous "
-              f"interrupted run before starting:")
+        print(f"Swept {len(stray)} leftover folder(s) from a previous interrupted run:")
         for s in stray:
             print(f"  removed: {s}")
         print()
 
-    work_dir = Path(tempfile.mkdtemp(prefix="lolbin_scoped_"))
-    print("=" * 72)
-    print(f"LOLBin Masquerading Tester -- Scoped Edition ({len(LOLBIN_TEST_CASES)} binaries, zero-payload)")
-    print("=" * 72)
-    print(f"Canary tag for this run: {CANARY_TAG}")
-    print(f"Underlying binary for every case: {SAFE_SOURCE_BINARY}")
-    print(f"Verified SHA256 of that binary: {source_hash}")
-    print(f"Parent chain: {PARENT_CHAIN}")
-    print(f"Dropping inert artifact files: {DROP_ARTIFACT_FILES}")
+    work_dir = Path(tempfile.mkdtemp(prefix="lolbin_qradar_"))
+    print("=" * 78)
+    print(f"LOLBin Tester -- Matched to Your QRadar Rules ({len(LOLBIN_TEST_CASES)} binaries)")
+    print("=" * 78)
+    print(f"Canary tag: {CANARY_TAG}")
+    print(f"hostname.exe SHA256 (8 direct cases): {source_hash}")
+    print(f"cmd.exe SHA256 (2 parent-check cases): {parent_hash}")
     print(f"Working directory: {work_dir}\n")
 
     log = []
     try:
         for name, cfg in LOLBIN_TEST_CASES.items():
             decoy_path = work_dir / name
-            shutil.copy2(SAFE_SOURCE_BINARY, decoy_path)
+            print(f"[*] {name}")
+            print(f"    QRadar logic: {cfg['qradar_logic']}")
 
+            if cfg["spawn_style"] == "parent_child":
+                shutil.copy2(SAFE_PARENT_BINARY, decoy_path)
+                decoy_hash = sha256_of(decoy_path)
+                if decoy_hash != parent_hash:
+                    print(f"    [!] hash mismatch after copy -- ABORTING, nothing executed.\n")
+                    log.append({"decoy_name": name, "variant": 0,
+                                "timestamp": datetime.now().isoformat(),
+                                "command": None, "status": "ABORTED - hash mismatch",
+                                "sha256": decoy_hash})
+                    continue
+
+                cmd = [str(decoy_path), "/c", SAFE_SOURCE_BINARY]
+                print(f"    command: {' '.join(cmd)}")
+                print(f"    (this spawns the real, unmodified hostname.exe as an "
+                      f"ACTUAL child, so its recorded parent is genuinely '{name}')")
+                ts = datetime.now().isoformat()
+                status, blocked = run_and_classify(cmd)
+                print(f"      -> {status}\n")
+                log.append({"decoy_name": name, "variant": 1, "timestamp": ts,
+                            "command": " ".join(cmd), "status": status,
+                            "sha256": decoy_hash})
+                time.sleep(1)
+                continue
+
+            # spawn_style == "direct"
+            shutil.copy2(SAFE_SOURCE_BINARY, decoy_path)
             decoy_hash = sha256_of(decoy_path)
             if decoy_hash != source_hash:
-                print(f"[!] {name}: hash mismatch after copy ({decoy_hash}) "
-                      f"-- ABORTING this test case, nothing executed.\n")
-                log.append({
-                    "decoy_name": name, "timestamp": datetime.now().isoformat(),
-                    "command": None, "status": "ABORTED - hash verification failed",
-                    "sha256": decoy_hash,
-                })
+                print(f"    [!] hash mismatch after copy -- ABORTING, nothing executed.\n")
+                log.append({"decoy_name": name, "variant": 0,
+                            "timestamp": datetime.now().isoformat(),
+                            "command": None, "status": "ABORTED - hash mismatch",
+                            "sha256": decoy_hash})
                 continue
 
             if DROP_ARTIFACT_FILES and cfg["artifact"]:
-                artifact_path = work_dir / cfg["artifact"]
-                artifact_path.write_text(
-                    f"PURPLE TEAM TEST ARTIFACT - NOT EXECUTABLE\n"
-                    f"Canary: {CANARY_TAG}\n"
-                    f"Simulated technique: {cfg['technique']}\n"
+                (work_dir / cfg["artifact"]).write_text(
+                    f"PURPLE TEAM TEST ARTIFACT - NOT EXECUTABLE\nCanary: {CANARY_TAG}\n"
                 )
 
-            print(f"[*] {name}  ({cfg['technique']}, syntax confidence: {cfg['confidence']})")
-
-            blocked_by_edr = False
+            blocked_any = False
             for i, args_fn in enumerate(cfg["args_variants"], start=1):
                 args = args_fn()
-                cmd = build_command(decoy_path, args)
+                cmd = [str(decoy_path)] + args
                 print(f"    variant {i}: {' '.join(cmd)}")
                 ts = datetime.now().isoformat()
-                try:
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                    status = f"exited on its own (rc={proc.returncode})"
-                except subprocess.TimeoutExpired:
-                    status = "did not exit within 15s (kill and check manually)"
-                except OSError as e:
-                    if getattr(e, "winerror", None) == 5:
-                        status = "BLOCKED (WinError 5 Access Denied -- EDR/AV prevention fired)"
-                        blocked_by_edr = True
-                    else:
-                        status = f"error: {e}"
-                except Exception as e:
-                    status = f"error: {e}"
-
+                status, blocked = run_and_classify(cmd)
                 print(f"      -> {status}")
-                log.append({
-                    "decoy_name": name, "variant": i, "timestamp": ts,
-                    "command": " ".join(cmd), "status": status,
-                    "sha256": decoy_hash,
-                })
+                log.append({"decoy_name": name, "variant": i, "timestamp": ts,
+                            "command": " ".join(cmd), "status": status,
+                            "sha256": decoy_hash})
                 time.sleep(1)
-                if blocked_by_edr:
-                    print(f"    (EDR blocked variant {i} -- not trying further "
-                          f"variants for {name}, the goal is already met)")
+                if blocked:
+                    blocked_any = True
                     break
             print()
     finally:
         cleaned, leftover = verified_cleanup(work_dir)
 
-    print("=" * 72)
+    print("=" * 78)
     if cleaned:
         print(f"CLEANUP VERIFIED: {work_dir} no longer exists on disk.")
-        print("Every decoy binary and placeholder artifact from this run is gone.")
     else:
-        print(f"CLEANUP INCOMPLETE: could not remove the following, likely")
-        print(f"because a file handle is still open somewhere:")
+        print(f"CLEANUP INCOMPLETE -- stuck files:")
         for f in leftover:
             print(f"  STUCK: {f}")
         print(f"Remaining folder: {work_dir}")
-        print("Close any lingering process (Task Manager) and delete this")
-        print("folder by hand -- it contains only inert copies of hostname.exe")
-        print("and plain-text placeholder files, nothing executable-as-payload.")
-    print("=" * 72 + "\n")
+    print("=" * 78 + "\n")
 
     if KEEP_RESULTS_LOG:
-        results_file = Path.cwd() / f"lolbin_laptop_results_{CANARY_TAG}.json"
+        results_file = Path.cwd() / f"lolbin_qradar_results_{CANARY_TAG}.json"
         with open(results_file, "w") as f:
             json.dump({
                 "canary_tag": CANARY_TAG,
-                "source_binary": SAFE_SOURCE_BINARY,
-                "source_sha256": source_hash,
-                "parent_chain": PARENT_CHAIN,
+                "hostname_sha256": source_hash,
+                "cmd_sha256": parent_hash,
                 "work_dir_cleaned": cleaned,
                 "work_dir_leftover_files": leftover,
                 "results": log,
             }, f, indent=2)
-        print(f"Results + verified hashes saved to: {results_file}")
-        print("This is the ONLY file this script leaves behind. Delete it")
-        print(f"any time with: Remove-Item '{results_file}'")
+        print(f"Results saved to: {results_file} (only file this script leaves behind)")
     else:
-        print("KEEP_RESULTS_LOG is False -- nothing was written to disk.")
-        print("This run is fully ephemeral; only console output above remains.")
+        print("KEEP_RESULTS_LOG is False -- nothing written to disk.")
 
-    print("\nDone. Search QRadar and your EDR console for the canary tag:")
-    print(f"  {CANARY_TAG}")
     blocked_count = sum(1 for e in log if "BLOCKED" in e["status"])
-    print(f"\n{blocked_count} of {len(LOLBIN_TEST_CASES)} binaries were actively "
-          f"BLOCKED by EDR prevention (WinError 5).")
-    print("For every other binary that 'exited on its own': that is NOT proof")
-    print("EDR missed it. It only means EDR didn't block the launch. Check the")
-    print("Falcon console's Detections/Activity tab for a non-blocking alert")
-    print("at that binary's timestamp before concluding anything either way --")
-    print("prevention and detection are different tiers and this script can")
-    print("only ever observe the prevention tier from the outside.")
-    print("\nWhat actually ran: one binary only, hostname.exe, every time,")
-    print("hash-verified before each execution. No injection, compilation,")
-    print("cabinet, memory-dumping, or network code ever ran.")
+    print(f"\nSearch QRadar for canary tag: {CANARY_TAG}")
+    print(f"{blocked_count} of {len(LOLBIN_TEST_CASES)} were blocked by EDR prevention (WinError 5).")
+    print("Everything else exiting cleanly means QRadar is the layer being validated here --")
+    print("that's the point of this script. It says nothing about EDR's behavioral coverage,")
+    print("since no real technique (injection, memory access, compile, cabinet) ever ran.")
 
 
 if __name__ == "__main__":
