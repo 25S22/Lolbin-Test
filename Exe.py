@@ -64,54 +64,90 @@ SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"
 
 LOLBIN_TEST_CASES = {
     "AddinUtil.exe": {
-        "args": lambda: ["-nodep", "-pipeline:decoy_addins_dir"],
+        "confidence": "low",
         "artifact": None,
         "technique": "T1218 - Executes DLLs discovered via .NET add-in pipeline scanning",
+        "args_variants": [
+            lambda: ["-nodep", "-pipeline:decoy_addins_dir"],
+        ],
     },
     "Diantz.exe": {
-        "args": lambda: ["decoy_source.txt", "decoy_archive.cab"],
+        "confidence": "high",
         "artifact": "decoy_archive.cab",
         "technique": "T1560.001 - Cabinet file creation for staging/exfil",
+        "args_variants": [
+            lambda: ["decoy_source.txt", "decoy_archive.cab"],
+        ],
     },
     "Control.exe": {
-        "args": lambda: ["decoy_payload.cpl"],
+        "confidence": "high",
         "artifact": "decoy_payload.cpl",
         "technique": "T1218.002 - Loads a Control Panel item (.cpl) as code",
+        "args_variants": [
+            lambda: ["decoy_payload.cpl"],
+            lambda: ["/name", "Microsoft.ThisPC", "/z", "decoy_payload.cpl"],
+        ],
     },
     "ilasm.exe": {
-        "args": lambda: ["decoy_payload.il", "/output=decoy_output.exe"],
+        "confidence": "high",
         "artifact": "decoy_output.exe",
         "technique": "T1027 / T1218 - Compiles IL to an EXE to evade static AV",
+        "args_variants": [
+            lambda: ["decoy_payload.il", "/output=decoy_output.exe"],
+            lambda: ["/exe", "/output=decoy_output.exe", "decoy_payload.il"],
+        ],
     },
     "RunExeHelper.exe": {
-        "args": lambda: ["decoy_target.exe"],
+        "confidence": "low",
         "artifact": None,
         "technique": "T1218 - Proxy execution of an arbitrary specified binary",
+        "args_variants": [
+            lambda: ["decoy_target.exe"],
+        ],
     },
     "RdrLeakDiag.exe": {
-        "args": lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/wait:0"],
+        "confidence": "medium",
         "artifact": None,
         "technique": "T1003 - Process memory diagnostic tool abused for memory dumping",
+        "args_variants": [
+            lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/wait:0"],
+            lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/fullmemdmp"],
+        ],
     },
     "msedge.exe": {
-        "args": lambda: ["--headless", "--disable-gpu", "--dump-dom", "https://example.com"],
+        "confidence": "high",
         "artifact": None,
         "technique": "T1105 / T1218 - Headless browser used to fetch/render remote content",
+        "args_variants": [
+            lambda: ["--headless", "--disable-gpu", "--dump-dom", "https://example.com"],
+            lambda: ["--headless=new", "--disable-gpu", "--print-to-pdf=decoy_output.pdf", "https://example.com"],
+        ],
     },
     "CustomShellHost.exe": {
-        "args": lambda: [],
+        "confidence": "low",
         "artifact": None,
         "technique": "T1218 - Can spawn a command shell as a default-shell replacement",
+        "args_variants": [
+            lambda: [],
+        ],
     },
     "Hh.exe": {
-        "args": lambda: ["decoy_payload.chm"],
+        "confidence": "medium",
         "artifact": "decoy_payload.chm",
         "technique": "T1218 - HTML Help executable used to run script/code embedded in a .chm",
+        "args_variants": [
+            lambda: ["decoy_payload.chm"],
+            lambda: ["ms-its:decoy_payload.chm::/payload.htm"],
+        ],
     },
     "Mavinject.exe": {
-        "args": lambda: [str(os.getpid()), "/INJECTRUNNING", "decoy_payload.dll"],
+        "confidence": "high",
         "artifact": "decoy_payload.dll",
         "technique": "T1218 / T1055.001 - Process injection via signed binary",
+        "args_variants": [
+            lambda: [str(os.getpid()), "/INJECTRUNNING", "decoy_payload.dll"],
+            lambda: [str(os.getpid()), "/INJECTRUNNING32", "decoy_payload.dll"],
+        ],
     },
 }
 
@@ -223,27 +259,40 @@ def main():
                     f"Simulated technique: {cfg['technique']}\n"
                 )
 
-            args = cfg["args"]()
-            cmd = build_command(decoy_path, args)
+            print(f"[*] {name}  ({cfg['technique']}, syntax confidence: {cfg['confidence']})")
 
-            print(f"[*] {name}  ({cfg['technique']})")
-            print(f"    command: {' '.join(cmd)}")
-            ts = datetime.now().isoformat()
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                status = f"exited on its own (rc={proc.returncode})"
-            except subprocess.TimeoutExpired:
-                status = "did not exit within 15s (kill and check manually)"
-            except Exception as e:
-                status = f"error: {e}"
+            blocked_by_edr = False
+            for i, args_fn in enumerate(cfg["args_variants"], start=1):
+                args = args_fn()
+                cmd = build_command(decoy_path, args)
+                print(f"    variant {i}: {' '.join(cmd)}")
+                ts = datetime.now().isoformat()
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                    status = f"exited on its own (rc={proc.returncode})"
+                except subprocess.TimeoutExpired:
+                    status = "did not exit within 15s (kill and check manually)"
+                except OSError as e:
+                    if getattr(e, "winerror", None) == 5:
+                        status = "BLOCKED (WinError 5 Access Denied -- EDR/AV prevention fired)"
+                        blocked_by_edr = True
+                    else:
+                        status = f"error: {e}"
+                except Exception as e:
+                    status = f"error: {e}"
 
-            print(f"    -> {status}\n")
-            log.append({
-                "decoy_name": name, "timestamp": ts,
-                "command": " ".join(cmd), "status": status,
-                "sha256": decoy_hash,
-            })
-            time.sleep(1)
+                print(f"      -> {status}")
+                log.append({
+                    "decoy_name": name, "variant": i, "timestamp": ts,
+                    "command": " ".join(cmd), "status": status,
+                    "sha256": decoy_hash,
+                })
+                time.sleep(1)
+                if blocked_by_edr:
+                    print(f"    (EDR blocked variant {i} -- not trying further "
+                          f"variants for {name}, the goal is already met)")
+                    break
+            print()
     finally:
         cleaned, leftover = verified_cleanup(work_dir)
 
@@ -283,11 +332,18 @@ def main():
 
     print("\nDone. Search QRadar and your EDR console for the canary tag:")
     print(f"  {CANARY_TAG}")
+    blocked_count = sum(1 for e in log if "BLOCKED" in e["status"])
+    print(f"\n{blocked_count} of {len(LOLBIN_TEST_CASES)} binaries were actively "
+          f"BLOCKED by EDR prevention (WinError 5).")
+    print("For every other binary that 'exited on its own': that is NOT proof")
+    print("EDR missed it. It only means EDR didn't block the launch. Check the")
+    print("Falcon console's Detections/Activity tab for a non-blocking alert")
+    print("at that binary's timestamp before concluding anything either way --")
+    print("prevention and detection are different tiers and this script can")
+    print("only ever observe the prevention tier from the outside.")
     print("\nWhat actually ran: one binary only, hostname.exe, every time,")
     print("hash-verified before each execution. No injection, compilation,")
-    print("cabinet, memory-dumping, or network code ever ran. Any alert you")
-    print("see reflects your control reacting to the masquerading pattern,")
-    print("not real malicious behavior.")
+    print("cabinet, memory-dumping, or network code ever ran.")
 
 
 if __name__ == "__main__":
