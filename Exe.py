@@ -1,33 +1,25 @@
-#!/usr/bin/env python3
 """
-LOLBin Name + Command-Line Match Tester -- Zero-Payload Edition
-==================================================================
-Generates Windows process-creation events that look like real LOLBin abuse
-in every field a detection rule typically inspects (Image name, full
-CommandLine, optionally ParentImage) -- while the binary that actually
-executes is always an unmodified copy of hostname.exe.
+LOLBin Masquerading Tester -- Scoped Edition (Zero-Payload)
+==============================================================
+Covers exactly these 10 LOLBins:
+  AddinUtil.exe, Diantz.exe, Control.exe, ilasm.exe, RunExeHelper.exe,
+  RdrLeakDiag.exe, msedge.exe, CustomShellHost.exe, Hh.exe, Mavinject.exe
 
-WHY THIS IS STILL SAFE
------------------------
-Windows records the full command line at CreateProcess time, before the
-target binary parses a single argument. So we can hand a renamed
-hostname.exe the exact argument strings a real attack would use (these
-are public, well-documented patterns from LOLBAS/MITRE ATT&CK) and the
-Sysmon/EDR event will show a realistic Image + CommandLine pair -- but
-hostname.exe has no code that does anything with "/INJECTRUNNING" or a
-".cab" path. It either ignores the args or errors out immediately.
-Either way, no injection, compilation, cabinet, or network operation ever
-actually runs. There is exactly one binary in this entire test: a plain
-copy of C:\\Windows\\System32\\hostname.exe.
+SAME SAFETY MODEL AS BEFORE:
+Every process that actually executes is an unmodified copy of
+hostname.exe, renamed on disk to match each LOLBin's filename. Windows
+launches binaries by their PE header, not their filename, so no matter
+what name or arguments are used, the code that runs is only ever
+hostname.exe: print computer name, exit. Argument strings below mimic
+publicly documented LOLBAS usage patterns purely so the CommandLine field
+in your telemetry looks realistic -- hostname.exe does nothing with them.
 
-WHAT'S NEW VS. THE SIMPLER VERSION
-------------------------------------
-1. Each decoy is launched with the real documented command-line syntax
-   for that LOLBin's abuse (matches rules that inspect CommandLine, not
-   just Image name).
-2. Optional: launch via "cmd.exe /c <decoy>" so ParentImage == cmd.exe,
-   matching rules that also check for a shell-spawned parent (toggle
-   SPAWN_VIA_CMD below).
+ACCURACY NOTE: I don't have live web access in this session, so exact
+flag syntax for the less common entries (AddinUtil, RunExeHelper,
+RdrLeakDiag, CustomShellHost) is reconstructed from memory and may not
+match the current LOLBAS.org entry or your specific QRadar rule's regex
+exactly. Cross-check against LOLBAS.org and adjust the `args` lambdas if
+your rule needs an exact match.
 
 REQUIREMENTS: Windows only.
 """
@@ -42,45 +34,78 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Flip to True to also simulate a shell-spawned parent process
-# (matches rules like "ParentImage == cmd.exe AND Image == mavinject.exe").
-SPAWN_VIA_CMD = False
+# "none" | "cmd" | "powershell" -- what spawns each decoy process.
+PARENT_CHAIN = "none"
 
-# The ONLY code that ever actually executes. hostname.exe: prints the
-# local computer name, has no argument-triggered functionality, no GUI,
-# no network access, no file writes.
+# Drop inert placeholder files referenced in each command line (text only,
+# not valid PE/IL/CPL/CAB in any way -- cannot be loaded or executed).
+DROP_ARTIFACT_FILES = True
+
+CANARY_TAG = f"PURPLE-TEAM-TEST-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
 SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"
 
-# name -> (documented real-world command line, ATT&CK technique)
-# Argument strings are the well-known public LOLBAS syntax. Files
-# referenced (e.g. decoy.dll, decoy.cab) do not need to exist -- hostname.exe
-# never opens them.
 LOLBIN_TEST_CASES = {
-    "mavinject.exe": {
-        "args": lambda: [str(os.getpid()), "/INJECTRUNNING", "decoy_payload.dll"],
-        "technique": "T1218 / T1055.001 - Process injection via signed binary",
+    "AddinUtil.exe": {
+        "args": lambda: ["-nodep", "-pipeline:decoy_addins_dir"],
+        "artifact": None,
+        "technique": "T1218 - Executes DLLs discovered via .NET add-in pipeline scanning",
+    },
+    "Diantz.exe": {
+        "args": lambda: ["decoy_source.txt", "decoy_archive.cab"],
+        "artifact": "decoy_archive.cab",
+        "technique": "T1560.001 - Cabinet file creation for staging/exfil",
+    },
+    "Control.exe": {
+        "args": lambda: ["decoy_payload.cpl"],
+        "artifact": "decoy_payload.cpl",
+        "technique": "T1218.002 - Loads a Control Panel item (.cpl) as code",
     },
     "ilasm.exe": {
         "args": lambda: ["decoy_payload.il", "/output=decoy_output.exe"],
-        "technique": "T1027 / T1218 - Compile IL to EXE to evade static AV",
+        "artifact": "decoy_output.exe",
+        "technique": "T1027 / T1218 - Compiles IL to an EXE to evade static AV",
     },
-    "diantz.exe": {
-        "args": lambda: ["decoy_source.txt", "decoy_archive.cab"],
-        "technique": "T1560.001 - Cabinet file creation for staging/exfil",
+    "RunExeHelper.exe": {
+        "args": lambda: ["decoy_target.exe"],
+        "artifact": None,
+        "technique": "T1218 - Proxy execution of an arbitrary specified binary",
     },
-    "certutil.exe": {
-        "args": lambda: ["-urlcache", "-split", "-f", "https://example.com/decoy.txt", "decoy.txt"],
-        "technique": "T1140 / T1105 - Encode/decode or download payloads",
+    "RdrLeakDiag.exe": {
+        "args": lambda: [f"/p:{os.getpid()}", "/o:decoy_dump_dir", "/wait:0"],
+        "artifact": None,
+        "technique": "T1003 - Process memory diagnostic tool abused for memory dumping",
     },
-    "csc.exe": {
-        "args": lambda: ["/out:decoy_output.exe", "decoy_payload.cs"],
-        "technique": "T1027 / T1127 - Compile C# source to EXE at runtime",
+    "msedge.exe": {
+        "args": lambda: ["--headless", "--disable-gpu", "--dump-dom", "https://example.com"],
+        "artifact": None,
+        "technique": "T1105 / T1218 - Headless browser used to fetch/render remote content",
     },
-    "msbuild.exe": {
-        "args": lambda: ["decoy_project.csproj"],
-        "technique": "T1127.001 - Execute arbitrary code via malicious .csproj",
+    "CustomShellHost.exe": {
+        "args": lambda: [],
+        "artifact": None,
+        "technique": "T1218 - Can spawn a command shell as a default-shell replacement",
+    },
+    "Hh.exe": {
+        "args": lambda: ["decoy_payload.chm"],
+        "artifact": "decoy_payload.chm",
+        "technique": "T1218 - HTML Help executable used to run script/code embedded in a .chm",
+    },
+    "Mavinject.exe": {
+        "args": lambda: [str(os.getpid()), "/INJECTRUNNING", "decoy_payload.dll"],
+        "artifact": "decoy_payload.dll",
+        "technique": "T1218 / T1055.001 - Process injection via signed binary",
     },
 }
+
+
+def build_command(decoy_path, args):
+    if PARENT_CHAIN == "cmd":
+        return ["cmd.exe", "/c", str(decoy_path)] + args
+    if PARENT_CHAIN == "powershell":
+        full = " ".join([f'"{decoy_path}"'] + args)
+        return ["powershell.exe", "-NoProfile", "-Command", full]
+    return [str(decoy_path)] + args
 
 
 def main():
@@ -93,13 +118,15 @@ def main():
         print(f"Could not find {SAFE_SOURCE_BINARY} -- aborting, nothing was run.")
         sys.exit(1)
 
-    work_dir = Path(tempfile.mkdtemp(prefix="lolbin_nametest_"))
+    work_dir = Path(tempfile.mkdtemp(prefix="lolbin_scoped_"))
     print("=" * 72)
-    print("LOLBin Name + Command-Line Tester (zero-payload)")
+    print(f"LOLBin Masquerading Tester -- Scoped Edition ({len(LOLBIN_TEST_CASES)} binaries, zero-payload)")
     print("=" * 72)
+    print(f"Canary tag for this run: {CANARY_TAG}")
     print(f"Underlying binary for every case: {SAFE_SOURCE_BINARY}")
-    print(f"Parent process simulation: {'cmd.exe' if SPAWN_VIA_CMD else 'this python process'}")
-    print(f"Temp working directory: {work_dir}\n")
+    print(f"Parent chain: {PARENT_CHAIN}")
+    print(f"Dropping inert artifact files: {DROP_ARTIFACT_FILES}")
+    print(f"Working directory: {work_dir}\n")
 
     log = []
     try:
@@ -107,38 +134,43 @@ def main():
             decoy_path = work_dir / name
             shutil.copy2(SAFE_SOURCE_BINARY, decoy_path)
 
+            if DROP_ARTIFACT_FILES and cfg["artifact"]:
+                artifact_path = work_dir / cfg["artifact"]
+                artifact_path.write_text(
+                    f"PURPLE TEAM TEST ARTIFACT - NOT EXECUTABLE\n"
+                    f"Canary: {CANARY_TAG}\n"
+                    f"Simulated technique: {cfg['technique']}\n"
+                )
+
             args = cfg["args"]()
-            if SPAWN_VIA_CMD:
-                cmd = ["cmd.exe", "/c", str(decoy_path)] + args
-            else:
-                cmd = [str(decoy_path)] + args
+            cmd = build_command(decoy_path, args)
 
             print(f"[*] {name}  ({cfg['technique']})")
             print(f"    command: {' '.join(cmd)}")
             ts = datetime.now().isoformat()
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
                 status = f"exited on its own (rc={proc.returncode})"
             except subprocess.TimeoutExpired:
-                status = "did not exit within 10s (unexpected)"
+                status = "did not exit within 15s (kill and check manually)"
             except Exception as e:
                 status = f"error: {e}"
 
             print(f"    -> {status}\n")
-            log.append({"decoy_name": name, "timestamp": ts, "command": " ".join(cmd), "status": status})
+            log.append({
+                "decoy_name": name, "timestamp": ts,
+                "command": " ".join(cmd), "status": status,
+            })
             time.sleep(1)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    print("Done. Cross-reference the timestamps/commands above against QRadar")
-    print("to confirm each rule fired on Image name and/or CommandLine.\n")
-    print("Scope notes:")
-    print(" - Decoys run from a temp folder, not the LOLBin's real System32/.NET")
-    print("   path -- rules that also check path won't fire here.")
-    print(" - Internal PE metadata (OriginalFilename) still says HOSTNAME --")
-    print("   rules keyed on that instead of on-disk filename won't fire here.")
-    print(" - Exactly one binary executed this entire run: hostname.exe. No")
-    print("   injection, compilation, cabinet, or network code ever ran.")
+    print("Done. Search QRadar and your EDR console for the canary tag:")
+    print(f"  {CANARY_TAG}")
+    print("\nWhat actually ran: one binary only, hostname.exe, every time.")
+    print("No injection, compilation, cabinet, memory-dumping, or network")
+    print("code ever executed. Any alert you see reflects your control")
+    print("reacting to the masquerading pattern, not real malicious behavior.")
 
 
 if __name__ == "__main__":
