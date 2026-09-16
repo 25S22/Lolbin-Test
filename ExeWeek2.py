@@ -1,41 +1,40 @@
-"""
-LOLBin Masquerading Tester -- 16 Binaries, for Security Event Log (4688) Pipelines
-=====================================================================================
-Scope (exactly these 16):
+r"""
+LOLBin Masquerading Tester -- 13 Remaining (excludes mshta, Csc, Diskshadow
+which already fired -- do not re-touch those).
+
+Scope (exactly these 13):
   AddinUtil.exe, Diantz.exe, Control.exe, ilasm.exe, RunExeHelper.exe,
   CustomShellHost.exe, Rundll32.exe, OneDriveStandaloneUpdater.exe,
-  Msconfig.exe, Csc.exe, mshta.exe, Dump64.exe, Fsutil.exe, Explorer.exe,
-  Diskshadow.exe, Sc.exe
+  Msconfig.exe, Dump64.exe, Fsutil.exe, Explorer.exe, Sc.exe
 
-Generates REAL Windows Security Event Log 4688 (Process Creation) records --
-genuinely audited by the OS itself, nothing fabricated.
+KEY FIX vs. the prior version: every referenced artifact now uses the
+FULL ABSOLUTE PATH inside the temp work directory, not a bare relative
+filename. Many real Sigma-style rules for path-sensitive LOLBins key off
+"argument path is NOT in System32/standard locations" -- a relative
+filename in the command line doesn't visibly carry that signal; an
+absolute Temp path does, and matches the actual suspicious-location
+condition those rules are checking for.
+
+CONFIDENCE NOTE: I don't have live access to SigmaHQ's repository in this
+session, so these are reconstructed from general knowledge of published
+LOLBAS/Sigma patterns, not verified against current rule text. The first
+6 below (AddinUtil, Diantz, Control, ilasm, RunExeHelper, CustomShellHost)
+still match YOUR literal QRadar rule text from earlier and are UNCHANGED
+in logic -- only the artifact paths were made absolute for consistency.
+If those 6 still don't fire, that points at QRadar rule config, not this
+script. For the other 7, I've applied the absolute-path fix plus, for
+Rundll32, an additional well-known public technique (zipfldr.dll,RouteTheCall).
 
 SAFETY MODEL (unchanged throughout this whole exercise):
-- 15 of 16 run an unmodified copy of hostname.exe, renamed on disk to the
-  LOLBin's filename. hostname.exe prints the local computer name and exits.
+- 12 of 13 run an unmodified copy of hostname.exe, renamed on disk.
   No argument-triggered functionality of any kind exists in it.
-- 1 of 16 (CustomShellHost.exe) needs a genuine PARENT-CHILD relationship
-  because its QRadar rule checks Parent Process Name. For only this case,
-  the renamed binary is a copy of cmd.exe, invoked with exactly one
-  hardcoded argument: "/c hostname.exe" -- ordinary process spawning, the
-  same operation every installer performs, never anything attacker-controlled.
+- 1 of 13 (CustomShellHost.exe) uses a renamed copy of cmd.exe, invoked
+  with exactly one hardcoded argument ("/c hostname.exe") to produce a
+  genuine (not spoofed) parent-child relationship.
 - Every copy is SHA256-verified against the real system binary immediately
   before execution. Any mismatch aborts that case with nothing run.
-- Cleanup is verified (not just attempted) after every run, and any
-  leftovers from a prior interrupted run are swept at startup.
-
-CONFIDENCE LEVELS:
-- The first 6 use command-line syntax matched directly against QRadar rule
-  text you provided. They didn't produce a QRadar offense in your last test
-  despite the process genuinely being created (you saw the path in the
-  logs) -- that's very likely a rule-configuration issue on QRadar's side
-  (disabled rule / response action / field-mapping mismatch), not something
-  a different command line fixes. Worth checking the Rules editor directly
-  for these 6 before re-running.
-- The other 10 use my best recollection of publicly documented LOLBAS
-  syntax -- I don't have your QRadar rule text for these yet, so treat
-  "low/medium" confidence ones as a starting point, not a guarantee. Send
-  me their exact rule conditions and I'll tighten these to match precisely.
+- Cleanup is verified after every run; leftovers from a prior interrupted
+  run are swept at startup.
 
 REQUIREMENTS: Windows only.
 """
@@ -55,104 +54,92 @@ from pathlib import Path
 KEEP_RESULTS_LOG = True
 CANARY_TAG = f"PURPLE-TEAM-TEST-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"   # 14 of 16 cases
-SAFE_PARENT_BINARY = r"C:\Windows\System32\cmd.exe"         # 2 parent-check cases
+SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"
+SAFE_PARENT_BINARY = r"C:\Windows\System32\cmd.exe"
 DROP_ARTIFACT_FILES = True
 
+# args_variants lambdas now take work_dir (Path) so they can build absolute
+# paths to the artifacts actually sitting in the temp directory.
 LOLBIN_TEST_CASES = {
-    # ---- 6 from the original set that did NOT fire last time ----
     "AddinUtil.exe": {
-        "spawn_style": "direct", "confidence": "high match, but did not fire -- check rule config",
-        "args_variants": [lambda: ["-pipelineroot:decoy_addins_dir"]], "artifact": None,
+        "spawn_style": "direct", "confidence": "high match to your rule text; check QRadar config if still silent",
+        "args_variants": [lambda wd: ["-pipelineroot:" + str(wd / "decoy_addins_dir")]],
+        "artifact": None,
         "qradar_logic": "Command contains 'addinutil.exe' AND ('-addinroot' or '-pipelineroot')",
     },
     "Diantz.exe": {
-        "spawn_style": "direct", "confidence": "high match, but did not fire -- check rule config",
-        "args_variants": [lambda: ["decoy_source.txt", "decoy_archive.cab"]],
+        "spawn_style": "direct", "confidence": "high match to your rule text; check QRadar config if still silent",
+        "args_variants": [lambda wd: [str(wd / "decoy_source.txt"), str(wd / "decoy_archive.cab")]],
         "artifact": "decoy_archive.cab",
         "qradar_logic": "Command contains 'diantz' AND '.cab'",
     },
     "Control.exe": {
-        "spawn_style": "direct", "confidence": "high match, but did not fire -- check rule config",
-        "args_variants": [lambda: ["decoy_payload.dll"]], "artifact": "decoy_payload.dll",
+        "spawn_style": "direct", "confidence": "high match to your rule text; check QRadar config if still silent",
+        "args_variants": [lambda wd: [str(wd / "decoy_payload.dll")]],
+        "artifact": "decoy_payload.dll",
         "qradar_logic": "Command contains 'control.exe' AND 'dll'",
     },
     "ilasm.exe": {
-        "spawn_style": "direct", "confidence": "high match, but did not fire -- check rule config",
-        "args_variants": [lambda: ["decoy_payload.il", "/output=decoy_output.exe"]],
-        "artifact": "decoy_output.exe",
+        "spawn_style": "direct", "confidence": "high match to your rule text; check QRadar config if still silent",
+        "args_variants": [lambda wd: [str(wd / "decoy_payload.il"), "/output=" + str(wd / "decoy_output.exe")]],
+        "artifact": "decoy_payload.il",
         "qradar_logic": "Process Name contains 'ilasm.exe' (no command-line condition)",
     },
     "RunExeHelper.exe": {
-        "spawn_style": "direct", "confidence": "high match, but did not fire -- check rule config",
-        "args_variants": [lambda: ["decoy_target.exe"]], "artifact": None,
+        "spawn_style": "direct", "confidence": "high match to your rule text; check QRadar config if still silent",
+        "args_variants": [lambda wd: [str(wd / "decoy_target.exe")]],
+        "artifact": None,
         "qradar_logic": "Command contains 'runexehelper'",
     },
     "CustomShellHost.exe": {
-        "spawn_style": "parent_child", "confidence": "high match, but did not fire -- check rule config",
-        "args_variants": [lambda: []], "artifact": None,
+        "spawn_style": "parent_child", "confidence": "high match to your rule text; check QRadar config if still silent",
+        "args_variants": [lambda wd: []], "artifact": None,
         "qradar_logic": ("Parent Process Name contains 'customshellhost.exe' AND "
                           "spawned Process Name does not contain 'explorer.exe'"),
     },
-
-    # ---- New 10 -- best-recollection LOLBAS syntax, UNVERIFIED against
-    #      your actual QRadar rules. Send me those rules to tighten these. ----
     "Rundll32.exe": {
-        "spawn_style": "direct", "confidence": "medium (unverified vs your rule)",
-        "args_variants": [lambda: ["decoy_payload.dll,DllRegisterServer"]],
+        "spawn_style": "direct", "confidence": "medium (Sigma-pattern guess, path now absolute)",
+        "args_variants": [
+            lambda wd: [str(wd / "decoy_payload.dll") + ",DllRegisterServer"],
+            lambda wd: ["zipfldr.dll,RouteTheCall", str(wd / "decoy_command.txt")],
+        ],
         "artifact": "decoy_payload.dll",
-        "qradar_logic": "UNKNOWN -- share your rule text",
+        "qradar_logic": "UNKNOWN -- guess: suspicious DLL path outside System32",
     },
     "OneDriveStandaloneUpdater.exe": {
-        "spawn_style": "direct", "confidence": "low (unverified vs your rule)",
-        "args_variants": [lambda: []], "artifact": None,
-        "qradar_logic": "UNKNOWN -- share your rule text",
+        "spawn_style": "direct", "confidence": "low -- real technique is DLL side-loading, not command-line based",
+        "args_variants": [lambda wd: []],
+        "artifact": "version.dll",   # commonly hijacked DLL name, dropped alongside as a FILE-placement signal
+        "qradar_logic": "UNKNOWN -- if rule is command-line based this likely won't match; may need file-creation-based test instead",
     },
     "Msconfig.exe": {
-        "spawn_style": "direct", "confidence": "low (unverified vs your rule)",
-        "args_variants": [lambda: []], "artifact": None,
-        "qradar_logic": "UNKNOWN -- share your rule text",
-    },
-    "Csc.exe": {
-        "spawn_style": "direct", "confidence": "medium (unverified vs your rule)",
-        "args_variants": [lambda: ["/out:decoy_output.exe", "decoy_payload.cs"]],
-        "artifact": "decoy_output.exe",
-        "qradar_logic": "UNKNOWN -- share your rule text",
-    },
-    "mshta.exe": {
-        "spawn_style": "direct", "confidence": "medium (unverified vs your rule)",
-        "args_variants": [lambda: ["decoy_payload.hta"]],
-        "artifact": "decoy_payload.hta",
+        "spawn_style": "direct", "confidence": "low (likely Process-Name-only, same ambiguity as ilasm)",
+        "args_variants": [lambda wd: []], "artifact": None,
         "qradar_logic": "UNKNOWN -- share your rule text",
     },
     "Dump64.exe": {
         "spawn_style": "direct", "confidence": "low (unverified vs your rule)",
-        "args_variants": [lambda: ["-p", str(os.getpid()), "-o", "decoy_dump.dmp"]],
+        "args_variants": [lambda wd: ["-p", str(os.getpid()), "-o", str(wd / "decoy_dump.dmp")]],
         "artifact": None,
         "qradar_logic": "UNKNOWN -- share your rule text",
     },
     "Fsutil.exe": {
         "spawn_style": "direct", "confidence": "medium (unverified vs your rule)",
-        "args_variants": [lambda: ["usn", "deletejournal", "/D", "C:"]],
+        "args_variants": [lambda wd: ["usn", "deletejournal", "/D", "C:"]],
         "artifact": None,
         "qradar_logic": "UNKNOWN -- share your rule text",
     },
     "Explorer.exe": {
         "spawn_style": "direct", "confidence": "low (unverified vs your rule)",
-        "args_variants": [lambda: ["decoy_target.exe"]], "artifact": None,
-        "qradar_logic": "UNKNOWN -- share your rule text",
-    },
-    "Diskshadow.exe": {
-        "spawn_style": "direct", "confidence": "medium (unverified vs your rule)",
-        "args_variants": [lambda: ["/s", "decoy_script.txt"]],
-        "artifact": "decoy_script.txt",
+        "args_variants": [lambda wd: [str(wd / "decoy_target.exe")]],
+        "artifact": None,
         "qradar_logic": "UNKNOWN -- share your rule text",
     },
     "Sc.exe": {
-        "spawn_style": "direct", "confidence": "medium (unverified vs your rule)",
-        "args_variants": [lambda: ["create", "decoysvc", "binpath=", r"C:\Test\decoy_payload.exe"]],
-        "artifact": None,
-        "qradar_logic": "UNKNOWN -- share your rule text",
+        "spawn_style": "direct", "confidence": "medium (Sigma-pattern guess, path now absolute)",
+        "args_variants": [lambda wd: ["create", "decoysvc", "binpath=", str(wd / "decoy_payload.exe")]],
+        "artifact": "decoy_payload.exe",
+        "qradar_logic": "UNKNOWN -- guess: suspicious binPath outside System32",
     },
 }
 
@@ -168,7 +155,7 @@ def sha256_of(path):
 def sweep_stray_runs():
     base = Path(tempfile.gettempdir())
     removed = []
-    for p in base.glob("lolbin16_*"):
+    for p in base.glob("lolbin13_*"):
         if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
             if not p.exists():
@@ -197,7 +184,7 @@ def verified_cleanup(work_dir):
 def run_and_classify(cmd, timeout=15):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return f"exited on its own (rc={proc.returncode})", False, proc.pid if hasattr(proc, "pid") else None
+        return f"exited on its own (rc={proc.returncode})", False, proc.pid
     except subprocess.TimeoutExpired:
         return "did not exit within timeout", False, None
     except OSError as e:
@@ -210,8 +197,7 @@ def run_and_classify(cmd, timeout=15):
 
 def main():
     if platform.system() != "Windows":
-        print("Windows only -- this script copies native Windows binaries "
-              "(hostname.exe, cmd.exe). Exiting without doing anything.")
+        print("Windows only -- exiting without doing anything.")
         sys.exit(1)
 
     if not Path(SAFE_SOURCE_BINARY).exists() or not Path(SAFE_PARENT_BINARY).exists():
@@ -225,14 +211,12 @@ def main():
     if stray:
         print(f"Swept {len(stray)} leftover folder(s) from a previous interrupted run.\n")
 
-    work_dir = Path(tempfile.mkdtemp(prefix="lolbin16_"))
+    work_dir = Path(tempfile.mkdtemp(prefix="lolbin13_"))
     print("=" * 78)
-    print(f"LOLBin Tester -- 16 scoped binaries, Security-Event-Log (4688) pipeline")
+    print("LOLBin Tester -- 13 remaining, absolute-path fix applied")
     print("=" * 78)
     print(f"Canary tag: {CANARY_TAG}")
-    print(f"hostname.exe SHA256: {source_hash}")
-    print(f"cmd.exe SHA256:      {parent_hash}")
-    print(f"Working directory:   {work_dir}\n")
+    print(f"Working directory: {work_dir}\n")
 
     log = []
     try:
@@ -243,15 +227,11 @@ def main():
 
             if cfg["spawn_style"] == "parent_child":
                 shutil.copy2(SAFE_PARENT_BINARY, decoy_path)
-                decoy_hash = sha256_of(decoy_path)
-                if decoy_hash != parent_hash:
+                if sha256_of(decoy_path) != parent_hash:
                     print("    [!] hash mismatch -- ABORTED\n")
-                    log.append({"decoy_name": name, "variant": 0,
-                                "timestamp": datetime.now().isoformat(),
-                                "command": None, "status": "ABORTED - hash mismatch"})
                     continue
                 cmd = [str(decoy_path), "/c", SAFE_SOURCE_BINARY]
-                print(f"    command: {' '.join(cmd)}  (real child spawn, parent = {name})")
+                print(f"    command: {' '.join(cmd)}")
                 ts = datetime.now().isoformat()
                 status, blocked, pid = run_and_classify(cmd)
                 print(f"      -> {status}  pid={pid}\n")
@@ -261,12 +241,8 @@ def main():
                 continue
 
             shutil.copy2(SAFE_SOURCE_BINARY, decoy_path)
-            decoy_hash = sha256_of(decoy_path)
-            if decoy_hash != source_hash:
+            if sha256_of(decoy_path) != source_hash:
                 print("    [!] hash mismatch -- ABORTED\n")
-                log.append({"decoy_name": name, "variant": 0,
-                            "timestamp": datetime.now().isoformat(),
-                            "command": None, "status": "ABORTED - hash mismatch"})
                 continue
 
             if DROP_ARTIFACT_FILES and cfg["artifact"]:
@@ -275,7 +251,7 @@ def main():
                 )
 
             for i, args_fn in enumerate(cfg["args_variants"], start=1):
-                cmd = [str(decoy_path)] + args_fn()
+                cmd = [str(decoy_path)] + args_fn(work_dir)
                 print(f"    variant {i}: {' '.join(cmd)}")
                 ts = datetime.now().isoformat()
                 status, blocked, pid = run_and_classify(cmd)
@@ -297,18 +273,16 @@ def main():
     print("=" * 78 + "\n")
 
     if KEEP_RESULTS_LOG:
-        results_file = Path.cwd() / f"lolbin16_results_{CANARY_TAG}.json"
+        results_file = Path.cwd() / f"lolbin13_results_{CANARY_TAG}.json"
         with open(results_file, "w") as f:
             json.dump({"canary_tag": CANARY_TAG, "results": log,
                        "work_dir_cleaned": cleaned}, f, indent=2)
         print(f"Results saved to: {results_file}")
 
-    blocked_count = sum(1 for e in log if "BLOCKED" in e.get("status", ""))
     print(f"\nSearch QRadar for canary tag: {CANARY_TAG}")
-    print(f"{blocked_count} of {len(LOLBIN_TEST_CASES)} blocked by EDR prevention.")
-    print("For the 6 flagged 'did not fire -- check rule config' above: the process")
-    print("was genuinely created (same as the ones that worked); check those rules'")
-    print("enabled/response state in QRadar directly rather than re-running this.")
+    print("Compare which of these 13 fire now vs before -- that tells us whether")
+    print("the absolute-path fix mattered, which is useful signal even for the")
+    print("ones still guessed rather than confirmed.")
 
 
 if __name__ == "__main__":
