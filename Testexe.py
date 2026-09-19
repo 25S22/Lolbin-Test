@@ -1,57 +1,64 @@
 #!/usr/bin/env python3
 r"""
-LOLBin Tester -- 8 Remaining, Sigma-Rule-Matched + PID Bug Fixed
-==================================================================
-Scope (exactly these 8):
-  AddinUtil.exe, RunExeHelper.exe, Rundll32.exe,
-  OneDriveStandaloneUpdater.exe, Msconfig.exe, Dump64.exe,
-  Explorer.exe, Sc.exe
+LOLBin Tester -- 4 Remaining, Sigma-sourced & Parent-Child Fixed
+=================================================================
+Scope: Rundll32.exe, RunExeHelper.exe, OneDriveStandaloneUpdater.exe,
+       Msconfig.exe, Sc.exe
 
-TWO KEY FIXES VS. ALL PRIOR VERSIONS:
+SOURCE FOR EVERY COMMAND LINE:
+Verified against the live SigmaHQ rule set via detection.fyi and
+raw.githubusercontent.com/SigmaHQ/sigma, September 2026.
 
-1. PID BUG FIXED:
-   Every prior version used subprocess.run() and then read proc.pid.
-   subprocess.CompletedProcess (the return type of run()) has no .pid
-   attribute -- this caused a silent AttributeError on every successful
-   run, caught by the except-Exception handler, so every process that
-   actually completed was reported as "error: ...no attribute 'pid'"
-   with pid=None instead of "exited on its own". Fixed by switching to
-   Popen() which exposes .pid before the process finishes, then
-   communicate() to wait. You will now see real PIDs and correct status.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BINARY-BY-BINARY FINDINGS FROM SIGMA REPO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-2. COMMAND LINES SOURCED FROM VERIFIED SIGMA RULES:
-   AddinUtil.exe -- proc_creation_win_addinutil_suspicious_cmdline.yml
-     Requires: -PipelineRoot: or -AddInRoot: AND the path must contain
-     \AppData\Local\Temp\ or \Windows\Temp\ etc. Using absolute temp path
-     satisfies this; the bare relative path used before did NOT.
-   Rundll32.exe  -- proc_creation_win_rundll32_susp_activity.yml
-     Requires known DLL+function pairs. Prior version used a custom DLL
-     path; now uses the exact documented pairs from the rule.
-   Explorer.exe  -- proc_creation_win_explorer_break_process_tree.yml
-     Requires /factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b} or
-     /root,<path>. Prior version used none of these.
-   Sc.exe        -- proc_creation_win_susp_service_creation.yml
-     Requires create + binPath= + suspicious path containing
-     \AppData\Local\Temp or C:\Windows\TEMP etc. Prior version used a
-     generic path that didn't match the suspicious-path condition.
-   RunExeHelper, OneDriveStandaloneUpdater, Msconfig, Dump64:
-     No dedicated SigmaHQ rules found in the public repo for these.
-     They are likely pure process-name rules in your QRadar deployment.
-     If they still don't fire, share the exact rule text and I'll match.
+Rundll32.exe   proc_creation_win_rundll32_susp_activity.yml
+  Detects 20+ DLL+function pairs. Every variant below is taken
+  verbatim from the rule's selection list.
 
-CASING: Each binary is also tried in lowercase and UPPERCASE in addition
-to the mixed case you specified -- this tests whether your QRadar rule's
-"Process Name contains" comparison is case-sensitive, which has been
-a suspected gap throughout.
+RunExeHelper.exe   proc_creation_win_lolbin_runexehelper.yml
+  Rule: ParentImage|endswith: '\runexehelper.exe'
+  *** SPAWN STYLE WAS WRONG IN EVERY PRIOR VERSION ***
+  The rule fires on the CHILD process, not on RunExeHelper itself.
+  Fix: rename cmd.exe → RunExeHelper.exe and invoke "/c hostname.exe"
+  so the recorded event for the child has ParentImage = runexehelper.exe.
 
-SAFETY MODEL (unchanged):
-- 7 of 8 use a hash-verified copy of hostname.exe renamed to the LOLBin
-  filename. hostname.exe ignores all arguments and exits immediately.
-- 1 of 8 (Explorer.exe) passes its own name in the CommandLine argument
-  (the /root, technique) -- still hostname.exe underneath, the argument
-  is just a string, no shell expansion occurs.
-- Cleanup is verified after every run; stray folders from prior
-  interrupted runs are swept at startup.
+OneDriveStandaloneUpdater.exe   registry_set only (no proc_creation rule)
+  The only SigmaHQ rule for OneDrive Standalone Updater is a registry_set
+  rule watching UpdateRingSettingURLFromOC -- NOT a process_creation rule.
+  A process-creation event for this binary will not match any public
+  Sigma process_creation rule. If your QRadar rule fires on this binary,
+  it must be a custom rule. Best-guess attempt included; share the exact
+  rule text so I can match it properly.
+
+Msconfig.exe   only UAC-bypass context in Sigma (proc_creation)
+  The only process_creation Sigma rule for msconfig requires
+  IntegrityLevel=High AND ParentImage=...\pkgmgr.exe -- a UAC bypass
+  scenario that cannot be safely replicated here. If your QRadar rule
+  fires on msconfig more generically (e.g., process-name only), share
+  the rule text. Best-guess process-name-only attempt included.
+
+Sc.exe   proc_creation_win_susp_service_creation.yml
+  Rule: Image endswith sc.exe + CommandLine contains 'create' + 'binPath='
+  + CommandLine contains a suspicious path/binary string such as
+  C:\Windows\TEMP\, \AppData\Local\Temp, cmd.exe /c, powershell, etc.
+  work_dir is ALWAYS in \AppData\Local\Temp\, so the absolute path to
+  the payload file satisfies the suspicious-path condition automatically.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PID BUG (fixed since the last round):
+  subprocess.run() returns CompletedProcess which has no .pid.
+  All versions here use Popen() to capture the real PID before
+  waiting for completion.
+
+SAFETY MODEL (unchanged throughout):
+  Direct cases: hash-verified copy of hostname.exe renamed to the
+    LOLBin filename. hostname.exe ignores all arguments and exits.
+  Parent-child cases (RunExeHelper): hash-verified copy of cmd.exe
+    renamed to RunExeHelper.exe, invoked with hardcoded "/c hostname.exe"
+    -- identical to the Hh.exe approach used in earlier rounds.
+  Cleanup verified after every run; stray folders swept at startup.
 
 REQUIREMENTS: Windows only.
 """
@@ -71,103 +78,79 @@ from pathlib import Path
 KEEP_RESULTS_LOG = True
 CANARY_TAG = f"PURPLE-TEAM-TEST-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 SAFE_SOURCE_BINARY = r"C:\Windows\System32\hostname.exe"
+SAFE_PARENT_BINARY = r"C:\Windows\System32\cmd.exe"
 DROP_ARTIFACT_FILES = True
 
-# Each entry:
-#   args_variants : list of lambdas taking work_dir (Path) -> list[str]
-#   artifact      : filename to drop as inert placeholder (or None)
-#   sigma_source  : which Sigma rule this is matched against
-#   qradar_logic  : what your QRadar rule checks (from your earlier text
-#                   or "UNKNOWN" where no rule text was shared)
+# spawn_style:
+#   "direct"       -- hostname.exe copy with args (fires on its own event)
+#   "parent_child" -- cmd.exe copy spawns hostname.exe (fires on child's event)
 LOLBIN_TEST_CASES = {
-    "AddinUtil.exe": {
-        "args_variants": [
-            # Sigma: Image endswith addinutil.exe AND
-            #   CommandLine contains -PipelineRoot: AND
-            #   CommandLine contains \AppData\Local\Temp\ (or similar suspicious path)
-            # work_dir IS in \AppData\Local\Temp\ so the absolute path satisfies
-            # the suspicious-directory condition automatically.
-            lambda wd: [f"-PipelineRoot:{wd}"],
-            lambda wd: [f"-AddInRoot:{wd}"],
-        ],
-        "artifact": None,
-        "sigma_source": "proc_creation_win_addinutil_suspicious_cmdline.yml",
-        "qradar_logic": "Command contains 'addinutil.exe' AND ('-addinroot' or '-pipelineroot')",
-    },
-    "RunExeHelper.exe": {
-        "args_variants": [
-            lambda wd: [str(wd / "decoy_target.exe")],
-        ],
-        "artifact": None,
-        "sigma_source": "No dedicated SigmaHQ rule found -- likely process-name only",
-        "qradar_logic": "Command contains 'runexehelper'",
-    },
     "Rundll32.exe": {
+        "spawn_style": "direct",
+        "sigma_rule": "proc_creation_win_rundll32_susp_activity.yml",
+        "sigma_condition": "CommandLine contains DLL+function pairs",
+        "qradar_logic": "UNKNOWN -- using Sigma-verified DLL+function pairs",
+        "artifact": None,
+        # Every variant below is verbatim from the Sigma rule's selection list.
+        # Using known-benign system DLLs that have no network/write side-effects
+        # when given a nonsense argument.
         "args_variants": [
-            # Sigma: proc_creation_win_rundll32_susp_activity.yml
-            # Multiple known DLL+function pairs -- using the most reliable ones
             lambda wd: ["zipfldr.dll,RouteTheCall", str(wd / "decoy_target.exe")],
             lambda wd: ["url.dll,OpenURL", "https://example.com"],
+            lambda wd: ["url.dll,FileProtocolHandler", str(wd / "decoy_target.txt")],
             lambda wd: ["pcwutl.dll,LaunchApplication", str(wd / "decoy_target.exe")],
+            lambda wd: ["dfshim.dll,ShOpenVerbShortcut", str(wd / "decoy_target.exe")],
             lambda wd: ["shell32.dll,Control_RunDLL", str(wd / "decoy_payload.dll")],
+            lambda wd: ["advpack.dll,LaunchINFSection", str(wd / "decoy.inf"), ",", "DefaultInstall"],
+            lambda wd: ["ieframe.dll,OpenURL", "https://example.com"],
         ],
-        "artifact": "decoy_payload.dll",
-        "sigma_source": "proc_creation_win_rundll32_susp_activity.yml",
-        "qradar_logic": "UNKNOWN -- using Sigma-documented DLL+function pairs",
+    },
+    "RunExeHelper.exe": {
+        "spawn_style": "parent_child",
+        "sigma_rule": "proc_creation_win_lolbin_runexehelper.yml",
+        "sigma_condition": "ParentImage|endswith: '\\runexehelper.exe' (fires on CHILD, not on RunExeHelper itself)",
+        "qradar_logic": "Command contains 'runexehelper' -- but your Qradar rule may also be parent-based",
+        "artifact": None,
+        "args_variants": [lambda wd: []],
     },
     "OneDriveStandaloneUpdater.exe": {
-        "args_variants": [
-            # No SigmaHQ rule found -- likely process-name only.
-            # Real abuse is DLL side-loading; no commandline pattern to match.
-            lambda wd: [],
-        ],
+        "spawn_style": "direct",
+        "sigma_rule": "registry_set/registry_set_lolbin_onedrivestandaloneupdater.yml (NOT process_creation)",
+        "sigma_condition": (
+            "NO process_creation Sigma rule exists for this binary. "
+            "The only public rule fires on a registry_set event "
+            "(UpdateRingSettingURLFromOC key). Process-name-only attempt below."
+        ),
+        "qradar_logic": "UNKNOWN -- share rule text; no public Sigma process_creation rule found",
         "artifact": None,
-        "sigma_source": "No dedicated SigmaHQ rule found -- share rule text to improve",
-        "qradar_logic": "UNKNOWN -- share your rule text",
+        "args_variants": [lambda wd: []],
     },
     "Msconfig.exe": {
-        "args_variants": [
-            # No SigmaHQ rule found -- likely process-name only.
-            lambda wd: [],
-        ],
+        "spawn_style": "direct",
+        "sigma_rule": "proc_creation_win_uac_bypass_msconfig_gui.yml (requires UAC context)",
+        "sigma_condition": (
+            "Only Sigma rule requires IntegrityLevel=High AND ParentImage=pkgmgr.exe "
+            "(UAC bypass scenario). No general process_creation rule exists. "
+            "Process-name-only attempt below -- share your rule text if this doesn't fire."
+        ),
+        "qradar_logic": "UNKNOWN -- share rule text; only UAC-bypass context exists in Sigma",
         "artifact": None,
-        "sigma_source": "No dedicated SigmaHQ rule found -- share rule text to improve",
-        "qradar_logic": "UNKNOWN -- share your rule text",
-    },
-    "Dump64.exe": {
-        "args_variants": [
-            # No dedicated SigmaHQ rule found.
-            # Dump64.exe is the VS debugger dump utility; common documented
-            # usage: dump64.exe <pid> <output_file>
-            lambda wd: [str(os.getpid()), str(wd / "decoy_dump.dmp")],
-        ],
-        "artifact": None,
-        "sigma_source": "No dedicated SigmaHQ rule found -- share rule text to improve",
-        "qradar_logic": "UNKNOWN -- share your rule text",
-    },
-    "Explorer.exe": {
-        "args_variants": [
-            # Sigma: proc_creation_win_explorer_break_process_tree.yml
-            # Pattern 1: factory CLSID used to break process tree
-            lambda wd: ["/factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b}"],
-            # Pattern 2: /root, flag to open specific path
-            lambda wd: [f"/root,{wd}"],
-        ],
-        "artifact": None,
-        "sigma_source": "proc_creation_win_explorer_break_process_tree.yml",
-        "qradar_logic": "UNKNOWN -- using Sigma-documented explorer lolbin patterns",
+        "args_variants": [lambda wd: []],
     },
     "Sc.exe": {
+        "spawn_style": "direct",
+        "sigma_rule": "proc_creation_win_susp_service_creation.yml",
+        "sigma_condition": (
+            "sc.exe + CommandLine contains 'create' + 'binPath=' "
+            "+ suspicious path string (C:\\Windows\\TEMP\\, \\AppData\\Local\\Temp, etc.)"
+        ),
+        "qradar_logic": "UNKNOWN -- using Sigma: create + binPath= + suspicious temp path",
+        "artifact": "decoy_payload.exe",
+        # work_dir is always in \AppData\Local\Temp\ -- the absolute path to the
+        # artifact satisfies the suspicious-path condition of the Sigma rule.
         "args_variants": [
-            # Sigma: proc_creation_win_susp_service_creation.yml
-            # Requires: create + binPath= + suspicious path
-            # work_dir is in \AppData\Local\Temp\ which is in the rule's
-            # suspicious-path list, so the absolute path satisfies the condition.
             lambda wd: ["create", "decoysvc", f"binPath={wd / 'decoy_payload.exe'}"],
         ],
-        "artifact": "decoy_payload.exe",
-        "sigma_source": "proc_creation_win_susp_service_creation.yml",
-        "qradar_logic": "UNKNOWN -- using Sigma: create + binPath= + suspicious temp path",
     },
 }
 
@@ -181,9 +164,8 @@ def sha256_of(path):
 
 
 def sweep_stray_runs():
-    base = Path(tempfile.gettempdir())
     removed = []
-    for p in base.glob("lolbin8sig_*"):
+    for p in Path(tempfile.gettempdir()).glob("lolbin4sig_*"):
         if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
             if not p.exists():
@@ -210,24 +192,14 @@ def verified_cleanup(work_dir):
 
 
 def run_and_classify(cmd, timeout=15):
-    """
-    BUG FIX: prior versions used subprocess.run() then read proc.pid.
-    CompletedProcess has no .pid -- this silently threw AttributeError
-    on every success, caught by except-Exception, returning pid=None
-    and status='error:...' for every process that actually completed.
-
-    Fix: Popen() gives us the real PID before the process finishes,
-    then communicate() waits for it to exit cleanly.
-    """
+    """Use Popen (not subprocess.run) so we capture the real PID before the
+    process exits. CompletedProcess has no .pid -- that was the bug causing
+    'pid=None' in every prior version."""
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        pid = proc.pid  # real PID, available immediately after Popen
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pid = proc.pid
         try:
-            _out, _err = proc.communicate(timeout=timeout)
+            proc.communicate(timeout=timeout)
             return f"exited on its own (rc={proc.returncode})", pid
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -235,7 +207,7 @@ def run_and_classify(cmd, timeout=15):
             return f"did not exit within {timeout}s -- killed", pid
     except OSError as e:
         if getattr(e, "winerror", None) == 5:
-            return "BLOCKED (WinError 5 Access Denied -- EDR/AV prevention fired)", None
+            return "BLOCKED (WinError 5 -- EDR/AV prevention fired)", None
         return f"launch error: {e}", None
     except Exception as e:
         return f"error: {e}", None
@@ -255,71 +227,87 @@ def main():
         print("Windows only -- exiting without doing anything.")
         sys.exit(1)
 
-    if not Path(SAFE_SOURCE_BINARY).exists():
-        print(f"Cannot find {SAFE_SOURCE_BINARY} -- aborting.")
-        sys.exit(1)
+    for binary in [SAFE_SOURCE_BINARY, SAFE_PARENT_BINARY]:
+        if not Path(binary).exists():
+            print(f"Cannot find {binary} -- aborting.")
+            sys.exit(1)
 
     source_hash = sha256_of(SAFE_SOURCE_BINARY)
+    parent_hash = sha256_of(SAFE_PARENT_BINARY)
 
     stray = sweep_stray_runs()
     if stray:
-        print(f"Swept {len(stray)} leftover folder(s) from a previous run.\n")
+        print(f"Swept {len(stray)} leftover folder(s) from previous run.\n")
 
-    work_dir = Path(tempfile.mkdtemp(prefix="lolbin8sig_"))
+    work_dir = Path(tempfile.mkdtemp(prefix="lolbin4sig_"))
     print("=" * 78)
-    print("LOLBin Tester -- 8 remaining, Sigma-matched + PID bug fixed")
+    print("LOLBin Tester -- Sigma-sourced, parent-child fixed, PID bug fixed")
     print("=" * 78)
-    print(f"Canary tag      : {CANARY_TAG}")
-    print(f"hostname.exe SHA: {source_hash}")
-    print(f"Working dir     : {work_dir}")
-    print(f"  (this path contains \\AppData\\Local\\Temp\\ or \\Windows\\Temp\\")
-    print(f"   which satisfies the suspicious-path condition in AddinUtil")
-    print(f"   and Sc.exe Sigma rules automatically)\n")
+    print(f"Canary tag    : {CANARY_TAG}")
+    print(f"hostname SHA  : {source_hash}")
+    print(f"cmd.exe SHA   : {parent_hash}")
+    print(f"Working dir   : {work_dir}")
+    print(f"  (contains \\AppData\\Local\\Temp\\ -- satisfies Sc.exe suspicious-path condition)\n")
 
     log = []
     try:
         for canonical_name, cfg in LOLBIN_TEST_CASES.items():
+            print(f"{'='*60}")
             print(f"[*] {canonical_name}")
-            print(f"    Sigma source : {cfg['sigma_source']}")
-            print(f"    QRadar logic : {cfg['qradar_logic']}")
+            print(f"    Sigma rule  : {cfg['sigma_rule']}")
+            print(f"    Sigma cond  : {cfg['sigma_condition']}")
+            print(f"    QRadar logic: {cfg['qradar_logic']}")
+            print()
 
             if DROP_ARTIFACT_FILES and cfg["artifact"]:
                 (work_dir / cfg["artifact"]).write_text(
-                    f"PURPLE TEAM TEST ARTIFACT - NOT EXECUTABLE\n"
-                    f"Canary: {CANARY_TAG}\n"
+                    f"PURPLE TEAM TEST ARTIFACT - NOT EXECUTABLE\nCanary: {CANARY_TAG}\n"
                 )
 
             for case_name in casing_variants(canonical_name):
                 decoy_path = work_dir / case_name
-                shutil.copy2(SAFE_SOURCE_BINARY, decoy_path)
-                copy_hash = sha256_of(decoy_path)
-                if copy_hash != source_hash:
-                    print(f"    [{case_name}] hash mismatch -- ABORTED")
+
+                if cfg["spawn_style"] == "parent_child":
+                    # RunExeHelper: rename cmd.exe so IT is the parent.
+                    # Child process (hostname.exe) will record ParentImage = case_name
+                    shutil.copy2(SAFE_PARENT_BINARY, decoy_path)
+                    if sha256_of(decoy_path) != parent_hash:
+                        print(f"    [{case_name}] hash mismatch (cmd.exe copy) -- ABORTED")
+                        continue
+                    cmd = [str(decoy_path), "/c", SAFE_SOURCE_BINARY]
+                    print(f"    [{case_name}] spawning child: {' '.join(cmd)}")
+                    print(f"    (child's ParentImage will be recorded as '{case_name}')")
+                    ts = datetime.now().isoformat()
+                    status, pid = run_and_classify(cmd)
+                    print(f"      -> {status}  pid={pid}")
+                    log.append({"canonical_name": canonical_name, "cased_as": case_name,
+                                "variant": 1, "timestamp": ts,
+                                "command": " ".join(cmd), "status": status, "pid": pid})
+                    time.sleep(0.75)
                     continue
 
-                blocked_this_casing = False
+                # Direct execution cases
+                shutil.copy2(SAFE_SOURCE_BINARY, decoy_path)
+                if sha256_of(decoy_path) != source_hash:
+                    print(f"    [{case_name}] hash mismatch (hostname copy) -- ABORTED")
+                    continue
+
+                blocked = False
                 for i, args_fn in enumerate(cfg["args_variants"], start=1):
                     cmd = [str(decoy_path)] + args_fn(work_dir)
                     print(f"    [{case_name}] v{i}: {' '.join(cmd)}")
                     ts = datetime.now().isoformat()
                     status, pid = run_and_classify(cmd)
                     print(f"         -> {status}  pid={pid}")
-                    log.append({
-                        "canonical_name": canonical_name,
-                        "cased_as": case_name,
-                        "variant": i,
-                        "timestamp": ts,
-                        "command": " ".join(cmd),
-                        "status": status,
-                        "pid": pid,
-                    })
+                    log.append({"canonical_name": canonical_name, "cased_as": case_name,
+                                "variant": i, "timestamp": ts,
+                                "command": " ".join(cmd), "status": status, "pid": pid})
                     time.sleep(0.75)
                     if "BLOCKED" in status:
-                        blocked_this_casing = True
+                        blocked = True
                         break
-
-                if blocked_this_casing:
-                    print(f"    Blocked on casing '{case_name}' -- skipping remaining casings")
+                if blocked:
+                    print(f"    EDR blocked on '{case_name}' -- skipping remaining casings")
                     break
 
             print()
@@ -327,28 +315,46 @@ def main():
         cleaned, leftover = verified_cleanup(work_dir)
 
     print("=" * 78)
-    print(f"CLEANUP VERIFIED: {work_dir} gone = {cleaned}")
+    print(f"CLEANUP: {work_dir} removed = {cleaned}")
     if not cleaned:
         for f in leftover:
             print(f"  STUCK: {f}")
-    print("=" * 78 + "\n")
+    print("=" * 78)
 
     if KEEP_RESULTS_LOG:
-        results_file = Path.cwd() / f"lolbin8sig_results_{CANARY_TAG}.json"
-        with open(results_file, "w") as f:
-            json.dump({
-                "canary_tag": CANARY_TAG,
-                "hostname_sha256": source_hash,
-                "work_dir_cleaned": cleaned,
-                "results": log,
-            }, f, indent=2)
-        print(f"Results saved to: {results_file}")
+        out = Path.cwd() / f"lolbin4sig_results_{CANARY_TAG}.json"
+        with open(out, "w") as f:
+            json.dump({"canary_tag": CANARY_TAG, "work_dir_cleaned": cleaned,
+                       "results": log}, f, indent=2)
+        print(f"\nResults saved: {out}")
 
-    print(f"\nSearch QRadar offenses for canary tag: {CANARY_TAG}")
-    print("For each binary, note WHICH casing (if any) produced an offense.")
-    print("If none of the 3 casings fire for a given binary and the event IS")
-    print("visible in Log Activity, share the raw parsed field values from")
-    print("that event and I can match the rule exactly.")
+    print(f"\nSearch QRadar for canary tag: {CANARY_TAG}")
+    print("""
+POST-RUN INTERPRETATION:
+
+  Rundll32   -- tries 8 Sigma-verified DLL+function variants in order.
+                If none fire, your QRadar rule may use different conditions
+                from the public Sigma rule. Share the rule text.
+
+  RunExeHelper -- spawn style was WRONG in all prior versions (running it
+                directly vs. making it the parent). Now fixed. The child
+                process will record RunExeHelper.exe as its ParentImage.
+                This should fire if your rule matches ParentImage.
+
+  OneDriveStandaloneUpdater -- NO public Sigma process_creation rule
+                exists for this binary. The only Sigma rule watches a
+                registry key (not a process). If your QRadar rule fires
+                on this, it's a custom rule. Share the conditions.
+
+  Msconfig    -- only public Sigma rule is a UAC bypass context (requires
+                elevated parent pkgmgr.exe). No general rule found.
+                If yours is process-name-only, it SHOULD fire here.
+                If it doesn't, share the exact conditions.
+
+  Sc.exe      -- Sigma rule needs create+binPath=+suspicious path.
+                work_dir is in AppData\\Local\\Temp which IS suspicious.
+                This should fire. If not, check sc.exe rule's field mapping.
+""")
 
 
 if __name__ == "__main__":
