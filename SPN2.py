@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Kerberoasting Detection Test — file-based edition
-  • No LDAP required at all
-  • SPNs loaded from a text file whose path you enter at runtime
-  • Username auto-discovered
-  • Password prompted securely
-  • Domain + KDC auto-discovered with TCP/UDP fallback + retries
+Kerberoasting Detection Test — file-based, no LDAP
+Fixes:
+  • Bare names in file used exactly as written (no /DOMAIN appended)
+  • Correct Kerberos principal type chosen per entry
 """
 
 import getpass
@@ -50,11 +48,6 @@ RETRY_BACKOFF  = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def with_retry(fn, label: str):
-    """
-    Run fn() up to RETRY_ATTEMPTS times with backoff.
-    Returns result on success, None if all attempts fail.
-    Never raises — caller decides what to do.
-    """
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             return fn()
@@ -66,7 +59,9 @@ def with_retry(fn, label: str):
                 )
                 time.sleep(RETRY_BACKOFF)
             else:
-                log.warning(f"[RETRY] {label} — all {RETRY_ATTEMPTS} attempts failed: {e}")
+                log.warning(
+                    f"[RETRY] {label} — all {RETRY_ATTEMPTS} attempts failed: {e}"
+                )
     return None
 
 
@@ -105,7 +100,6 @@ def discover_domain() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def discover_kdc_hosts(domain: str) -> list[str]:
-    """Return all KDC hostnames from DNS SRV, priority sorted."""
     hosts: list[str] = []
     if HAS_DNS:
         try:
@@ -119,16 +113,13 @@ def discover_kdc_hosts(domain: str) -> list[str]:
                 log.info(f"[DNS]  KDC from SRV: {host}  (priority={rr.priority})")
         except Exception as e:
             log.warning(f"[DNS]  SRV lookup failed: {e}")
-
     if not hosts:
         log.info(f"[DNS]  Falling back to domain name as KDC: {domain}")
         hosts.append(domain)
-
     return hosts
 
 
 def resolve_all_ips(host: str) -> list[str]:
-    """Get ALL A records for a host — gives multiple DCs to try."""
     try:
         results = socket.getaddrinfo(host, None, socket.AF_INET)
         ips = list(dict.fromkeys(r[4][0] for r in results))
@@ -154,7 +145,6 @@ def check_tcp88(ip: str) -> bool:
 
 
 def check_udp88(ip: str) -> bool:
-    """Send a minimal Kerberos probe on UDP/88 — any response = reachable."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(TCP_TIMEOUT)
@@ -171,10 +161,6 @@ def check_udp88(ip: str) -> bool:
 
 
 def find_reachable_kdc(domain: str) -> str | None:
-    """
-    Walk every KDC hostname × every IP × TCP then UDP.
-    Returns first reachable IP, or None if everything fails.
-    """
     for host in discover_kdc_hosts(domain):
         ips = resolve_all_ips(host) or [host]
         for ip in ips:
@@ -187,24 +173,19 @@ def find_reachable_kdc(domain: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FILE LOADING + SPN VALIDATION
+# FILE LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_spns_from_file(path: str, domain: str, username: str) -> list[str]:
+def load_spns_from_file(path: str, username: str) -> list[str]:
     """
-    Read SPNs from a text file.
+    Load service accounts / SPNs from file exactly as written.
+    No transformation of bare names — what you put in is what gets requested.
 
-    Accepted formats (one per line):
-        MSSQLSvc/sql01.corp.local:1433   ← full SPN, used as-is
-        HTTP/web01.corp.local            ← full SPN, used as-is
-        svc_backup                       ← bare name → built as svc_backup/DOMAIN
-        # comment lines are ignored
-        (blank lines are ignored)
-
-    Filters out entries that would not trigger the alert:
-        • service name == krbtgt
-        • service name contains $  (machine account)
-        • service name == your own username
+    File format:
+        MSSQLSvc/sql01.corp.local:1433   ← full SPN, NT_SRV_INST principal
+        HTTP/web01.corp.local            ← full SPN, NT_SRV_INST principal
+        s-admin                          ← bare name, NT_PRINCIPAL — FIX: no /DOMAIN added
+        # comments ignored
     """
     p = Path(path.strip())
     if not p.is_file():
@@ -227,15 +208,13 @@ def load_spns_from_file(path: str, domain: str, username: str) -> list[str]:
     skipped: list[str] = []
 
     for entry in raw_lines:
-        # Build a proper SPN if only a bare name was given
-        if "/" not in entry:
-            spn = f"{entry}/{domain}"
-            log.info(f"[FILE] Bare name '{entry}' → SPN '{spn}'")
-        else:
-            spn = entry
+        # ── FIX: use the entry exactly as written, no /DOMAIN construction ──
+        spn = entry
 
-        # --- Alert condition filters ---
-        svc = spn.split("/")[0].lower()
+        # Alert condition filters
+        # For full SPNs the service name is before the /
+        # For bare names the whole string is the service name
+        svc = spn.split("/")[0].lower() if "/" in spn else spn.lower()
 
         if svc == "krbtgt":
             log.info(f"[SKIP] {spn}  — service is krbtgt")
@@ -253,16 +232,17 @@ def load_spns_from_file(path: str, domain: str, username: str) -> list[str]:
             continue
 
         spns.append(spn)
+        log.info(f"[FILE] Accepted: '{spn}'  "
+                 f"({'full SPN' if '/' in spn else 'bare account name — used as-is'})")
 
-    # Hard cap — keep traffic minimal
     if len(spns) > MAX_SPNS:
-        log.info(f"[FILE] Capping at {MAX_SPNS} SPNs (file had {len(spns)} valid entries)")
+        log.info(f"[FILE] Capping at {MAX_SPNS} (file had {len(spns)} valid entries)")
         spns = spns[:MAX_SPNS]
 
     if skipped:
-        log.info(f"[FILE] Skipped {len(skipped)} entries that would not trigger alert")
+        log.info(f"[FILE] Skipped {len(skipped)} entries that fail alert conditions")
 
-    log.info(f"[FILE] {len(spns)} SPN(s) ready for testing")
+    log.info(f"[FILE] {len(spns)} entry/entries ready for testing")
     return spns
 
 
@@ -271,7 +251,6 @@ def load_spns_from_file(path: str, domain: str, username: str) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tgt_from_ccache(domain: str):
-    """Try reusing an existing TGT from KRB5CCNAME (Linux only)."""
     path = os.environ.get("KRB5CCNAME", "").replace("FILE:", "")
     if not path or not os.path.exists(path):
         return None
@@ -310,16 +289,17 @@ def get_tgt(username: str, password: str, domain: str, dc_ip: str):
     return tgt, cipher, old_sk, sk
 
 
-def request_tgs(tgt, cipher, old_sk, sk,
-                spn: str, domain: str, dc_ip: str) -> bool:
-    def _request():
-        svc = Principal(spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
-        getKerberosTGS(svc, domain, dc_ip, tgt, cipher, sk)
-
-    result = with_retry(_request, f"TGS-REQ ({spn})")
-    if result is not None or True:   # with_retry returns None on failure
-        return True
-    return False
+def make_principal(spn: str):
+    """
+    FIX: choose the correct Kerberos principal type.
+      MSSQLSvc/sql01.corp.local  →  NT_SRV_INST  (has a /)
+      s-admin                    →  NT_PRINCIPAL  (bare name, no /)
+    Using NT_SRV_INST for a bare name is what caused KDC_ERR_S_PRINCIPAL_UNKNOWN.
+    """
+    if "/" in spn:
+        return Principal(spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+    else:
+        return Principal(spn, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -329,11 +309,9 @@ def request_tgs(tgt, cipher, old_sk, sk,
 def main():
     print("\n── Kerberoasting Detection Test (file-based, no LDAP) ──\n")
 
-    # 1. Identity
     username = discover_username()
+    domain   = discover_domain()
 
-    # 2. Domain + KDC
-    domain = discover_domain()
     if not domain:
         log.error(
             "Domain not found.\n"
@@ -353,42 +331,43 @@ def main():
         )
         sys.exit(1)
 
-    # 3. File path — prompted at runtime, no hardcoding
+    # File path entered at runtime
     print()
     spn_file = input("Path to service accounts file: ").strip()
-    spns     = load_spns_from_file(spn_file, domain, username)
+    spns     = load_spns_from_file(spn_file, username)
 
     if not spns:
         log.error(
-            "No usable SPNs after filtering.\n"
-            "  Check that your file contains valid SPNs or service account names\n"
-            "  and that none are krbtgt / machine accounts ($) / your own username."
+            "No usable entries after filtering.\n"
+            "  Check that your file is not all krbtgt / machine accounts / "
+            "your own username."
         )
         sys.exit(1)
 
-    # 4. Password — ccache check first
+    # Credentials
     if os.environ.get("KRB5CCNAME"):
         log.info("[AUTH] KRB5CCNAME set — will try existing ticket first")
         password = ""
     else:
         print(
-            "\n[NOTE] Password is used only for the AS-REQ to your own KDC.\n"
-            "       It is never stored or sent anywhere else.\n"
+            "\n[NOTE] Password used only for the AS-REQ to your own KDC.\n"
+            "       Never stored or sent anywhere else.\n"
         )
         password = getpass.getpass(f"Password for {username}@{domain}: ")
 
-    # 5. Show plan before doing anything
+    # Plan summary
     sep = "=" * 60
     print(f"\n{sep}")
     print(f"  Domain   : {domain}")
     print(f"  User     : {username}@{domain}")
     print(f"  KDC      : {dc_ip}")
-    print(f"  SPNs     : {len(spns)}")
+    print(f"  Entries  : {len(spns)}")
     for s in spns:
-        print(f"             → {s}")
+        kind = "full SPN" if "/" in s else "bare account"
+        print(f"             → {s}  ({kind})")
     print(f"{sep}\n")
 
-    # 6. Get TGT
+    # Get TGT
     tgt_result = get_tgt(username, password, domain, dc_ip)
     if tgt_result is None:
         log.error(
@@ -396,19 +375,19 @@ def main():
             "  Possible causes:\n"
             "    • Wrong password\n"
             "    • Account locked / disabled\n"
-            "    • Clock skew > 5 minutes  (Kerberos hard requirement)\n"
+            "    • Clock skew > 5 minutes\n"
             "    • DC unreachable after retries"
         )
         sys.exit(1)
 
     tgt, cipher, old_sk, sk = tgt_result
 
-    # 7. TGS-REQ per SPN — stop immediately after
+    # TGS-REQ per entry
     results: dict[str, bool] = {}
     for i, spn in enumerate(spns, 1):
         log.info(f"\n── {i}/{len(spns)}")
         try:
-            svc = Principal(spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+            svc = make_principal(spn)        # ← FIX: correct type per entry
             getKerberosTGS(svc, domain, dc_ip, tgt, cipher, sk)
             log.info(f"[TGS-REP] ✓  {spn}  →  Event 4769 generated")
             results[spn] = True
@@ -419,7 +398,7 @@ def main():
         if i < len(spns):
             time.sleep(DELAY)
 
-    # 8. Summary
+    # Summary
     ok  = [s for s, r in results.items() if r]
     nok = [s for s, r in results.items() if not r]
 
@@ -434,18 +413,19 @@ def main():
     print(f"\n  Tickets received : {len(ok)}/{len(spns)}")
     print(f"  Alert should fire: {'YES ✓' if len(ok) >= 3 else 'NO — need >= 3'}")
 
+    if nok:
+        print(f"\n  Failed entries — likely causes:")
+        print(f"    • KDC_ERR_S_PRINCIPAL_UNKNOWN → account/SPN not found in AD")
+        print(f"      (check spelling in your file exactly matches AD)")
+        print(f"    • KDC_ERR_ETYPE_NOSUPP        → encryption type mismatch")
+        print(f"    • KDC_ERR_C_PRINCIPAL_UNKNOWN  → your own account not found")
+
     if ok:
         print(f"\n  All fired events satisfy:")
-        print(f"    Event ID 4769                    ✓")
-        print(f"    Account name != Service name     ✓")
-        print(f"    Service name != krbtgt           ✓")
-        print(f"    Service name contains no $       ✓")
-
-    if nok:
-        print(f"\n  Failed SPNs — likely causes:")
-        print(f"    • SPN exists in AD but service account has no keys")
-        print(f"    • SPN string is malformed (check your file format)")
-        print(f"    • Service account was deleted after SPN was registered")
+        print(f"    Event ID 4769                 ✓")
+        print(f"    Account name != Service name  ✓")
+        print(f"    Service name != krbtgt        ✓")
+        print(f"    Service name contains no $    ✓")
 
     print(f"{sep}\n")
 
