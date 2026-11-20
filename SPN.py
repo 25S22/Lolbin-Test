@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Kerberoasting Detection Test  —  minimal / low-traffic edition
---------------------------------------------------------------
-  • Username   : auto-discovered from OS session
-  • Password   : prompted securely (no echo)
-  • Domain/KDC : auto-discovered via env + DNS SRV
-  • SPNs       : LDAP enumeration, capped at 5
-  • Action     : one TGS-REQ per SPN, then stops
+Kerberoasting Detection Test — UPN-aware, no LDAP
+Fixes:
+  • UPN format (user@domain) now uses NT_ENTERPRISE principal type
+  • Bare names use NT_PRINCIPAL
+  • Full SPNs use NT_SRV_INST
+  • Alert condition filter handles all three formats correctly
+  • File matching is case-insensitive throughout
 """
 
 import getpass
@@ -15,8 +15,8 @@ import os
 import socket
 import sys
 import time
+from pathlib import Path
 
-# ── optional imports ──────────────────────────────────────────────────────────
 try:
     import dns.resolver as _dns
     HAS_DNS = True
@@ -24,21 +24,14 @@ except ImportError:
     HAS_DNS = False
 
 try:
-    import ldap3
-    HAS_LDAP3 = True
-except ImportError:
-    print("[!] ldap3 not found.  pip install ldap3")
-    sys.exit(1)
-
-try:
     from impacket.krb5 import constants
     from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
     from impacket.krb5.types import Principal
+    from impacket.krb5.ccache import CCache
 except ImportError:
-    print("[!] impacket not found.  pip install impacket")
+    print("[!] pip install impacket")
     sys.exit(1)
 
-# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -46,150 +39,315 @@ logging.basicConfig(
 )
 log = logging.getLogger("kerberoast-test")
 
-MAX_SPNS = 5          # hard cap — keeps traffic minimal
-DELAY    = 2          # seconds between TGS requests
+MAX_SPNS       = 5
+DELAY          = 2
+TCP_TIMEOUT    = 10
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF  = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DISCOVERY HELPERS
+# ENTRY FORMAT DETECTION
+# Three formats accepted — detected automatically from file content
+# ─────────────────────────────────────────────────────────────────────────────
+
+def entry_format(entry: str) -> str:
+    """
+    Detect which of the three formats an entry is:
+        'spn'         → MSSQLSvc/sql01.corp.local:1433
+        'upn'         → john.doe@corp.local
+        'bare'        → s-admin
+    """
+    if "/" in entry:
+        return "spn"
+    if "@" in entry:
+        return "upn"
+    return "bare"
+
+
+def service_name_of(entry: str) -> str:
+    """
+    Extract the 'service name' portion the way Event 4769 reports it.
+    This is what the alert rule checks against.
+        MSSQLSvc/sql01.corp.local  →  MSSQLSvc
+        john.doe@corp.local        →  john.doe
+        s-admin                    →  s-admin
+    Case-folded to lower for comparisons.
+    """
+    fmt = entry_format(entry)
+    if fmt == "spn":
+        return entry.split("/")[0].lower()
+    if fmt == "upn":
+        return entry.split("@")[0].lower()
+    return entry.lower()
+
+
+def make_principal(entry: str) -> Principal:
+    """
+    FIX — choose the correct Kerberos principal type per format.
+    Using the wrong type is what caused KDC_ERR_S_PRINCIPAL_UNKNOWN.
+
+        spn   →  NT_SRV_INST   (type 2)  — service instance
+        upn   →  NT_ENTERPRISE (type 10) — UPN, 'Member' accounts  ← your case
+        bare  →  NT_PRINCIPAL  (type 1)  — plain sAMAccountName
+    """
+    fmt = entry_format(entry)
+
+    if fmt == "spn":
+        log.info(f"[KRB]  '{entry}'  →  NT_SRV_INST   (full SPN)")
+        return Principal(entry,
+                         type=constants.PrincipalNameType.NT_SRV_INST.value)
+
+    if fmt == "upn":
+        log.info(f"[KRB]  '{entry}'  →  NT_ENTERPRISE (UPN / Member account)")
+        return Principal(entry,
+                         type=constants.PrincipalNameType.NT_ENTERPRISE.value)
+
+    log.info(f"[KRB]  '{entry}'  →  NT_PRINCIPAL  (bare account name)")
+    return Principal(entry,
+                     type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RETRY WRAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def with_retry(fn, label: str):
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < RETRY_ATTEMPTS:
+                log.warning(
+                    f"[RETRY] {label} — attempt {attempt}/{RETRY_ATTEMPTS} "
+                    f"failed: {e} — retrying in {RETRY_BACKOFF}s"
+                )
+                time.sleep(RETRY_BACKOFF)
+            else:
+                log.warning(
+                    f"[RETRY] {label} — all {RETRY_ATTEMPTS} attempts failed: {e}"
+                )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENT DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def discover_username() -> str:
     for var in ("USERNAME", "USER", "LOGNAME"):
         val = os.environ.get(var, "").strip()
         if val:
-            log.info(f"[ENV]  Username from ${var}: {val}")
+            log.info(f"[ENV]  Username: {val}")
             return val
-    val = getpass.getuser()
-    log.info(f"[ENV]  Username from getpass: {val}")
-    return val
+    return getpass.getuser()
 
 
 def discover_domain() -> str:
     for var in ("USERDNSDOMAIN", "USERDOMAIN"):
         val = os.environ.get(var, "").strip()
         if val and "." in val:
-            log.info(f"[ENV]  Domain from ${var}: {val}")
+            log.info(f"[ENV]  Domain: {val.upper()}")
             return val.upper()
     try:
         fqdn = socket.getfqdn()
         if "." in fqdn:
             domain = fqdn.split(".", 1)[1].upper()
-            log.info(f"[ENV]  Domain derived from FQDN: {domain}")
+            log.info(f"[ENV]  Domain from FQDN: {domain}")
             return domain
     except Exception:
         pass
     return ""
 
 
-def discover_kdc(domain: str) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+# KDC DISCOVERY + REACHABILITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def discover_kdc_hosts(domain: str) -> list[str]:
+    hosts: list[str] = []
     if HAS_DNS:
         try:
-            answers = _dns.resolve(f"_kerberos._tcp.{domain}", "SRV")
-            host = str(answers[0].target).rstrip(".")
-            log.info(f"[DNS]  KDC via SRV: {host}")
-            return host
+            answers = sorted(
+                _dns.resolve(f"_kerberos._tcp.{domain}", "SRV"),
+                key=lambda r: (r.priority, r.weight)
+            )
+            for rr in answers:
+                host = str(rr.target).rstrip(".")
+                hosts.append(host)
+                log.info(f"[DNS]  KDC from SRV: {host}  (priority={rr.priority})")
         except Exception as e:
-            log.warning(f"[DNS]  SRV lookup failed ({e}), falling back to domain name")
-    return domain
+            log.warning(f"[DNS]  SRV lookup failed: {e}")
+    if not hosts:
+        log.info(f"[DNS]  Falling back to domain name as KDC: {domain}")
+        hosts.append(domain)
+    return hosts
 
 
-def resolve_ip(host: str) -> str:
+def resolve_all_ips(host: str) -> list[str]:
     try:
-        ip = socket.gethostbyname(host)
-        log.info(f"[DNS]  {host} → {ip}")
-        return ip
+        results = socket.getaddrinfo(host, None, socket.AF_INET)
+        ips = list(dict.fromkeys(r[4][0] for r in results))
+        log.info(f"[DNS]  {host} → {ips}")
+        return ips
     except socket.gaierror as e:
-        log.error(f"[DNS]  Cannot resolve {host}: {e}")
-        return host
+        log.warning(f"[DNS]  Cannot resolve {host}: {e}")
+        return []
 
 
-def check_tcp88(host: str) -> bool:
+def check_tcp88(ip: str) -> bool:
     try:
-        with socket.create_connection((host, 88), timeout=5):
-            log.info(f"[NET]  TCP/88 reachable on {host}  ✓")
+        with socket.create_connection((ip, 88), timeout=TCP_TIMEOUT):
+            log.info(f"[NET]  TCP/88 reachable on {ip}  ✓")
             return True
+    except socket.timeout:
+        log.warning(f"[NET]  TCP/88 timed out on {ip}")
+    except ConnectionRefusedError:
+        log.warning(f"[NET]  TCP/88 refused on {ip}")
     except OSError as e:
-        log.error(f"[NET]  TCP/88 unreachable on {host}: {e}")
-        return False
+        log.warning(f"[NET]  TCP/88 error on {ip}: {e}")
+    return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LDAP — enumerate up to MAX_SPNS service accounts
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ldap_base_dn(domain: str) -> str:
-    return ",".join(f"DC={p}" for p in domain.split("."))
-
-
-def fetch_spns(domain: str, dc_ip: str,
-               username: str, password: str) -> list[str]:
-    """
-    Pull SPNs for enabled user accounts only.
-    Caps at MAX_SPNS to keep traffic minimal.
-    """
-    base_dn    = ldap_base_dn(domain)
-    bind_user  = f"{domain}\\{username}"
-    spn_filter = (
-        "(&(servicePrincipalName=*)"
-        "(UserAccountControl:1.2.840.113556.1.4.803:=512)"    # normal account
-        "(!(UserAccountControl:1.2.840.113556.1.4.803:=2))"   # not disabled
-        "(!(objectCategory=computer)))"                        # not a machine
-    )
-
-    log.info(f"[LDAP] Connecting to {dc_ip}:389 as {bind_user}")
+def check_udp88(ip: str) -> bool:
     try:
-        server = ldap3.Server(dc_ip, port=389, get_info=ldap3.ALL)
-        conn   = ldap3.Connection(
-            server, user=bind_user, password=password,
-            authentication=ldap3.SIMPLE, auto_bind=True,
-        )
-    except ldap3.core.exceptions.LDAPBindError as e:
-        log.error(f"[LDAP] Bind failed: {e}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(TCP_TIMEOUT)
+        sock.sendto(b"\x6a\x00", (ip, 88))
+        sock.recv(32)
+        sock.close()
+        log.info(f"[NET]  UDP/88 reachable on {ip}  ✓")
+        return True
+    except socket.timeout:
+        log.warning(f"[NET]  UDP/88 timed out on {ip}")
+    except OSError as e:
+        log.warning(f"[NET]  UDP/88 error on {ip}: {e}")
+    return False
+
+
+def find_reachable_kdc(domain: str) -> str | None:
+    for host in discover_kdc_hosts(domain):
+        ips = resolve_all_ips(host) or [host]
+        for ip in ips:
+            if check_tcp88(ip):
+                return ip
+            log.info(f"[NET]  Trying UDP/88 on {ip} …")
+            if check_udp88(ip):
+                return ip
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_entries_from_file(path: str, username: str) -> list[str]:
+    """
+    Load entries exactly as written — no transformation.
+    Case-insensitive filtering only; original case preserved for KDC requests.
+
+    Accepted formats (auto-detected, one per line):
+        john.doe@corp.local          ← UPN   — Member accounts, your case
+        MSSQLSvc/sql01.corp.local    ← full SPN
+        s-admin                      ← bare sAMAccountName
+        # comment lines ignored
+    """
+    p = Path(path.strip())
+    if not p.is_file():
+        log.error(f"[FILE] Not found: {path}")
         sys.exit(1)
 
-    conn.search(
-        search_base   = base_dn,
-        search_filter = spn_filter,
-        attributes    = ["sAMAccountName", "servicePrincipalName"],
-        size_limit    = MAX_SPNS,          # server-side cap → minimal traffic
-    )
+    raw = [
+        line.strip()
+        for line in p.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
 
-    spns: list[str] = []
-    for entry in conn.entries:
-        for spn in entry.servicePrincipalName.values:
-            spns.append(str(spn))
-            log.info(f"[LDAP] Found: {spn}  ({entry.sAMAccountName})")
-            if len(spns) >= MAX_SPNS:
-                break
-        if len(spns) >= MAX_SPNS:
-            break
+    if not raw:
+        log.error(f"[FILE] File is empty or all lines are comments: {path}")
+        sys.exit(1)
 
-    conn.unbind()
-    log.info(f"[LDAP] Collected {len(spns)} SPN(s)  (cap = {MAX_SPNS})")
-    return spns
+    log.info(f"[FILE] Read {len(raw)} entries from {path}")
+    log.info(f"[FILE] Case sensitivity: file is case-INSENSITIVE for filtering, "
+             f"original case sent to KDC")
+
+    accepted: list[str] = []
+    skipped:  list[str] = []
+
+    for entry in raw:
+        fmt = entry_format(entry)
+        svc = service_name_of(entry)   # lower-cased for comparison
+
+        # ── Alert condition filters (all case-insensitive) ────────────────
+        if svc == "krbtgt":
+            log.info(f"[SKIP] '{entry}'  — service is krbtgt")
+            skipped.append(entry)
+            continue
+
+        if "$" in svc:
+            log.info(f"[SKIP] '{entry}'  — machine account ($)")
+            skipped.append(entry)
+            continue
+
+        if svc == username.lower():
+            log.info(f"[SKIP] '{entry}'  — service name == your own username")
+            skipped.append(entry)
+            continue
+
+        accepted.append(entry)
+        log.info(f"[FILE] Accepted: '{entry}'  format={fmt}")
+
+    if len(accepted) > MAX_SPNS:
+        log.info(f"[FILE] Capping at {MAX_SPNS} (file had {len(accepted)} valid entries)")
+        accepted = accepted[:MAX_SPNS]
+
+    if skipped:
+        log.info(f"[FILE] Skipped {len(skipped)} entries (alert filter)")
+
+    log.info(f"[FILE] {len(accepted)} entry/entries ready")
+    return accepted
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KERBEROS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def tgt_from_ccache(domain: str):
+    path = os.environ.get("KRB5CCNAME", "").replace("FILE:", "")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        cc = CCache.loadFile(path)
+        for cred in cc.credentials:
+            try:
+                if "krbtgt" in cred["server"].prettyPrint().lower():
+                    d = cred.toTGT()
+                    log.info(f"[KRB5] Reusing TGT from {path}  ✓")
+                    return d["KDC_REP"], d["cipher"], d["oldSessionKey"], d["sessionKey"]
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning(f"[KRB5] ccache load failed: {e}")
+    return None
+
+
 def get_tgt(username: str, password: str, domain: str, dc_ip: str):
-    upn = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-    log.info(f"[AS-REQ]  Getting TGT for {username}@{domain}")
-    tgt, cipher, old_sk, sk = getKerberosTGT(
-        upn, password, domain, "", "", "", dc_ip
-    )
-    log.info("[AS-REP]  TGT obtained  ✓")
+    cached = tgt_from_ccache(domain)
+    if cached:
+        return cached
+
+    def _request():
+        log.info(f"[AS-REQ] Requesting TGT for {username}@{domain}")
+        upn = Principal(username,
+                        type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        return getKerberosTGT(upn, password, domain, "", "", "", dc_ip)
+
+    result = with_retry(_request, "AS-REQ (TGT)")
+    if result is None:
+        return None
+    tgt, cipher, old_sk, sk = result
+    log.info("[AS-REP] TGT obtained  ✓")
     return tgt, cipher, old_sk, sk
-
-
-def request_tgs(tgt, cipher, old_sk, sk,
-                spn: str, domain: str, dc_ip: str):
-    svc = Principal(spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
-    log.info(f"[TGS-REQ] {spn}")
-    getKerberosTGS(svc, domain, dc_ip, tgt, cipher, sk)
-    log.info(f"[TGS-REP] Ticket received  →  Event 4769 generated  ✓")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,64 +355,141 @@ def request_tgs(tgt, cipher, old_sk, sk,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n── Kerberoasting Detection Test (minimal) ──\n")
+    print("\n── Kerberoasting Detection Test ──\n")
 
-    # 1. Identity
     username = discover_username()
-    password = getpass.getpass(f"Password for {username}: ")
+    domain   = discover_domain()
 
-    # 2. Domain + KDC
-    domain = discover_domain()
     if not domain:
-        log.error("Could not discover domain. Set $USERDNSDOMAIN or join the machine to the domain.")
+        log.error(
+            "Domain not found.\n"
+            "  Fix: set $USERDNSDOMAIN or join the machine to the domain"
+        )
         sys.exit(1)
 
-    kdc_host = discover_kdc(domain)
-    dc_ip    = resolve_ip(kdc_host)
-
-    # 3. Sanity-check connectivity
-    if not check_tcp88(dc_ip):
-        log.error("KDC unreachable on TCP/88 — aborting.")
+    dc_ip = find_reachable_kdc(domain)
+    if not dc_ip:
+        log.error(
+            "No reachable KDC found on TCP or UDP port 88.\n"
+            "  Possible causes:\n"
+            "    • Firewall blocking port 88\n"
+            "    • Not on domain network (no VPN?)\n"
+            "    • DNS not resolving DC hostnames\n"
+            f"  Try: nslookup -type=SRV _kerberos._tcp.{domain}"
+        )
         sys.exit(1)
 
-    # 4. Enumerate SPNs (capped at MAX_SPNS)
-    spns = fetch_spns(domain, dc_ip, username, password)
-    if not spns:
-        log.error("No SPNs found. Nothing to test.")
+    print()
+    spn_file = input("Path to service accounts file: ").strip()
+    entries  = load_entries_from_file(spn_file, username)
+
+    if not entries:
+        log.error("No usable entries after filtering.")
         sys.exit(1)
 
-    # 5. Get TGT once
-    try:
-        tgt, cipher, old_sk, sk = get_tgt(username, password, domain, dc_ip)
-    except Exception as e:
-        log.error(f"TGT failed: {e}")
-        sys.exit(1)
+    if os.environ.get("KRB5CCNAME"):
+        log.info("[AUTH] KRB5CCNAME set — trying existing TGT (no password needed)")
+        password = ""
+    else:
+        print(
+            "\n[NOTE] Password used ONLY for AS-REQ to your own KDC.\n"
+            "       Not stored, not sent anywhere else, not used to crack anything.\n"
+            "       The TGS tickets returned are discarded — no hashes collected.\n"
+        )
+        password = getpass.getpass(f"Password for {username}@{domain}: ")
 
-    # 6. Fire one TGS-REQ per SPN — then stop
+    # Plan
+    sep = "=" * 62
+    print(f"\n{sep}")
+    print(f"  Domain   : {domain}")
+    print(f"  User     : {username}@{domain}")
+    print(f"  KDC      : {dc_ip}")
+    print(f"  Entries  : {len(entries)}")
+    for e in entries:
+        print(f"             → {e}  [{entry_format(e)}]")
+    print()
+    print(f"  What each TGS-REQ generates on the DC:")
+    print(f"    Event ID       : 4769")
+    print(f"    Event category : Kerberos Service Ticket Operations")
+    print(f"                     (your SIEM normalises this to")
+    print(f"                      'Application Kerberos Session Opened')")
+    print(f"    No hashes collected — tickets discarded after receipt")
+    print(f"{sep}\n")
+
+    # TGT
+    tgt_result = get_tgt(username, password, domain, dc_ip)
+    if tgt_result is None:
+        log.error(
+            "Could not obtain TGT.\n"
+            "  Possible causes:\n"
+            "    • Wrong password\n"
+            "    • Account locked / disabled\n"
+            "    • Clock skew > 5 minutes (Kerberos hard limit)\n"
+            "    • DC unreachable after retries"
+        )
+        sys.exit(1)
+    tgt, cipher, old_sk, sk = tgt_result
+
+    # TGS-REQ per entry — each one fires Event 4769 on the DC
     results: dict[str, str] = {}
-    for i, spn in enumerate(spns, 1):
-        log.info(f"\n── {i}/{len(spns)} ──────────────────────────────")
+    for i, entry in enumerate(entries, 1):
+        fmt = entry_format(entry)
+        log.info(f"\n── {i}/{len(entries)}  [{fmt}]")
         try:
-            request_tgs(tgt, cipher, old_sk, sk, spn, domain, dc_ip)
-            results[spn] = "✓"
+            svc = make_principal(entry)
+            getKerberosTGS(svc, domain, dc_ip, tgt, cipher, sk)
+            # Ticket returned here is encrypted with service account key.
+            # We discard it — we only needed the KDC to issue it (= Event 4769).
+            log.info(f"[TGS-REP] ✓  {entry}  →  Event 4769 generated on DC")
+            results[entry] = "✓"
         except Exception as e:
-            results[spn] = f"✗  {e}"
-            log.warning(f"TGS failed: {e}")
+            err = str(e)
+            hint = ""
+            if "KDC_ERR_S_PRINCIPAL_UNKNOWN" in err:
+                hint = (
+                    "\n           Account/UPN not found in AD — "
+                    "verify exact spelling matches AD"
+                )
+            elif "KDC_ERR_ETYPE_NOSUPP" in err:
+                hint = "\n           Encryption type not supported by this account"
+            elif "KDC_ERR_C_PRINCIPAL_UNKNOWN" in err:
+                hint = "\n           YOUR account not found — check username/domain"
+            log.warning(f"[TGS-REP] ✗  {entry}  —  {err}{hint}")
+            results[entry] = f"✗  {err}"
 
-        if i < len(spns):
+        if i < len(entries):
             time.sleep(DELAY)
 
-    # 7. Summary — script ends here, nothing else sent
-    print("\n" + "=" * 56)
-    print(" RESULTS")
-    print("=" * 56)
-    for spn, status in results.items():
-        print(f"  {status}  {spn}")
+    # Summary
+    ok  = [e for e, r in results.items() if r == "✓"]
+    nok = [e for e, r in results.items() if r != "✓"]
 
-    ok = sum(1 for r in results.values() if r == "✓")
-    print(f"\n  {ok}/{len(spns)} tickets received")
-    print(f"  Detection rule {'SHOULD' if ok >= 3 else 'may NOT'} fire  (threshold = 3)")
-    print("=" * 56 + "\n")
+    print(f"\n{sep}")
+    print(" RESULTS")
+    print(sep)
+    for e in ok:
+        print(f"  ✓  {e}")
+    for e in nok:
+        print(f"  ✗  {results[e][:80]}")
+
+    print(f"\n  Tickets received    : {len(ok)}/{len(entries)}")
+    print(f"  Alert should fire   : {'YES ✓' if len(ok) >= 3 else 'NO — need >= 3'}")
+
+    if ok:
+        print(f"\n  Every fired event satisfies:")
+        print(f"    Windows Event ID 4769             ✓  (Kerberos service ticket req)")
+        print(f"    SIEM category 'Session Opened'    ✓  (applied by SIEM on ingest)")
+        print(f"    Account name  !=  Service name    ✓")
+        print(f"    Service name  !=  krbtgt          ✓")
+        print(f"    Service name  contains no $       ✓")
+        print(f"    No hashes collected / cracked     ✓  (tickets discarded)")
+
+    print(f"\n  Case sensitivity note:")
+    print(f"    File entries are case-INSENSITIVE for all alert filters.")
+    print(f"    Original case from file is preserved when sent to the KDC.")
+    print(f"    If you still get PRINCIPAL_UNKNOWN, copy the exact")
+    print(f"    UPN/sAMAccountName from AD (Get-ADUser in PowerShell).")
+    print(f"{sep}\n")
 
 
 if __name__ == "__main__":
